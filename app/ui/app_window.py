@@ -37,7 +37,7 @@ class AppWindow:
         self._drag_target_idx: int | None = None
 
         # Outils d'annotation classiques (Visualisation PDF)
-        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow
+        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow | select | move
         self.ann_color_var = tk.StringVar(value="bleu")  # couleur trait / flèche
         self.ann_width_var = tk.IntVar(value=3)          # épaisseur trait / flèche
 
@@ -381,7 +381,7 @@ class AppWindow:
 
         ttk.Label(bar, text="Outils :").pack(side="left")
 
-        for txt, val in [("Aucun", "none"), ("Main levée", "ink"), ("Texte", "textbox"), ("Flèche", "arrow"), ("Sélection", "select")]:
+        for txt, val in [("Aucun", "none"), ("Main levée", "ink"), ("Texte", "textbox"), ("Flèche", "arrow"), ("Sélection", "select"), ("Déplacer", "move")]:
             ttk.Radiobutton(
                 bar,
                 text=txt,
@@ -469,6 +469,12 @@ class AppWindow:
             set_state(self._ann_text_entry, False)
             set_state(self._text_color_combo, False)
             set_state(self._text_size_spin, False)
+        elif tool == "move":
+            set_state(self._ann_color_combo, False)
+            set_state(self._ann_width_spin, False)
+            set_state(self._ann_text_entry, False)
+            set_state(self._text_color_combo, False)
+            set_state(self._text_size_spin, False)
         else:
             set_state(self._ann_color_combo, False)
             set_state(self._ann_width_spin, False)
@@ -502,6 +508,12 @@ class AppWindow:
         self._sel_drag_click = None
         self._sel_drag_origin = None
         self._sel_drag_moved = False
+        # déplacement (move)
+        self._move_drag_id = None
+        self._move_drag_page = None
+        self._move_drag_click = None
+        self._move_drag_origin = None
+        self._move_drag_moved = False
 
     # ---------------- Sélection / suppression d'annotations ----------------
     def _update_selection_info(self) -> None:
@@ -604,6 +616,152 @@ class AppWindow:
         self._refresh_files_list()
         self._refresh_info_panel()
         self._refresh_correction_totals()
+
+    def _start_move_drag(self, ann_id: str | None, page_index: int, x_pt: float, y_pt: float) -> None:
+        """Démarre un déplacement (outil 'Déplacer') pour une annotation sélectionnée."""
+        self._move_drag_id = None
+        self._move_drag_page = None
+        self._move_drag_click = None
+        self._move_drag_origin = None
+        self._move_drag_moved = False
+
+        if not ann_id:
+            return
+        if len(self._selected_ann_ids) != 1 or ann_id not in self._selected_ann_ids:
+            return
+
+        anns = self._annotations_for_current_doc()
+        ann = next((a for a in anns if isinstance(a, dict) and str(a.get("id", "")) == ann_id), None)
+        if not ann:
+            return
+
+        kind = ann.get("kind")
+        self._move_drag_id = ann_id
+        self._move_drag_page = int(page_index)
+        self._move_drag_click = (float(x_pt), float(y_pt))
+
+        if kind == "score_circle":
+            self._move_drag_origin = ("score_circle", float(ann.get("x_pt", 0.0)), float(ann.get("y_pt", 0.0)))
+        elif kind == "score_table":
+            x0 = float(ann.get("x_pt", 0.0))
+            y0 = float(ann.get("y_pt", 0.0))
+            rect = ann.get("rect")
+            rect_copy = list(rect) if isinstance(rect, list) else None
+            self._move_drag_origin = ("score_table", x0, y0, rect_copy)
+        elif kind == "arrow":
+            s = ann.get("start")
+            e = ann.get("end")
+            s0 = list(s) if isinstance(s, list) else None
+            e0 = list(e) if isinstance(e, list) else None
+            self._move_drag_origin = ("arrow", s0, e0)
+        elif kind == "textbox":
+            r = ann.get("rect")
+            r0 = list(r) if isinstance(r, list) else None
+            self._move_drag_origin = ("textbox", r0)
+        elif kind == "ink":
+            pts = ann.get("points")
+            pts0 = [list(p) for p in pts] if isinstance(pts, list) else None
+            self._move_drag_origin = ("ink", pts0)
+        else:
+            # kind inconnu -> pas déplaçable (V0)
+            self._move_drag_id = None
+            self._move_drag_page = None
+            self._move_drag_click = None
+            self._move_drag_origin = None
+            self._move_drag_moved = False
+
+
+    def _move_move_drag(self, x_pt: float, y_pt: float) -> None:
+        if not self._move_drag_id or not self._move_drag_click or not self._move_drag_origin:
+            return
+        cx, cy = self._move_drag_click
+        dx = float(x_pt) - float(cx)
+        dy = float(y_pt) - float(cy)
+
+        anns = self._annotations_for_current_doc()
+        ann = next((a for a in anns if isinstance(a, dict) and str(a.get("id", "")) == self._move_drag_id), None)
+        if not ann:
+            return
+
+        kind0 = self._move_drag_origin[0]
+
+        if kind0 == "score_circle":
+            _, ox, oy = self._move_drag_origin
+            ann["x_pt"] = float(ox) + dx
+            ann["y_pt"] = float(oy) + dy
+            self._move_drag_moved = True
+            return
+
+        if kind0 == "score_table":
+            _, ox, oy, rect0 = self._move_drag_origin
+            ann["x_pt"] = float(ox) + dx
+            ann["y_pt"] = float(oy) + dy
+            if isinstance(rect0, list) and len(rect0) == 4:
+                try:
+                    x0, y0, x1, y1 = [float(v) for v in rect0]
+                    ann["rect"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
+                except Exception:
+                    pass
+            self._move_drag_moved = True
+            return
+
+        if kind0 == "arrow":
+            _, s0, e0 = self._move_drag_origin
+            if isinstance(s0, list) and isinstance(e0, list) and len(s0) == 2 and len(e0) == 2:
+                ann["start"] = [float(s0[0]) + dx, float(s0[1]) + dy]
+                ann["end"] = [float(e0[0]) + dx, float(e0[1]) + dy]
+                self._move_drag_moved = True
+            return
+
+        if kind0 == "textbox":
+            _, r0 = self._move_drag_origin
+            if isinstance(r0, list) and len(r0) == 4:
+                try:
+                    x0, y0, x1, y1 = [float(v) for v in r0]
+                    ann["rect"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
+                    self._move_drag_moved = True
+                except Exception:
+                    pass
+            return
+
+        if kind0 == "ink":
+            _, pts0 = self._move_drag_origin
+            if isinstance(pts0, list) and pts0:
+                pts_new = []
+                for p in pts0:
+                    if isinstance(p, list) and len(p) == 2:
+                        try:
+                            pts_new.append([float(p[0]) + dx, float(p[1]) + dy])
+                        except Exception:
+                            pass
+                if pts_new:
+                    ann["points"] = pts_new
+                    self._move_drag_moved = True
+            return
+
+
+    def _end_move_drag(self) -> None:
+        if not getattr(self, "_move_drag_id", None):
+            return
+
+        moved = bool(getattr(self, "_move_drag_moved", False))
+
+        # reset state
+        self._move_drag_id = None
+        self._move_drag_page = None
+        self._move_drag_click = None
+        self._move_drag_origin = None
+        self._move_drag_moved = False
+
+        if not moved or not self.project:
+            return
+
+        self.project.save()
+        self.c_regenerate()
+        self._refresh_files_list()
+        self._refresh_info_panel()
+        self._refresh_correction_totals()
+
 
     def ann_clear_selection(self) -> None:
         self._selected_ann_ids.clear()
@@ -785,6 +943,10 @@ class AppWindow:
                 self._start_sel_drag(ann_id, page_index, x_pt, y_pt)
                 return
 
+            if tool == "move":
+                ann_id = self._select_annotation_at(page_index, x_pt, y_pt)
+                self._start_move_drag(ann_id, page_index, x_pt, y_pt)
+                return
 
             if tool == "ink":
                 self._draw_points = [(float(x_pt), float(y_pt))]
@@ -815,6 +977,12 @@ class AppWindow:
                 if self._sel_drag_page is None or int(page_index) != int(self._sel_drag_page):
                     return
                 self._move_sel_drag(x_pt, y_pt)
+                return
+
+            if self._draw_kind == "move":
+                if self._move_drag_page is None or int(page_index) != int(self._move_drag_page):
+                    return
+                self._move_move_drag(x_pt, y_pt)
                 return
 
             if self._draw_kind == "ink":
@@ -853,6 +1021,11 @@ class AppWindow:
 
             if tool == "select":
                 self._end_sel_drag()
+                self._reset_draw_state()
+                return
+
+            if tool == "move":
+                self._end_move_drag()
                 self._reset_draw_state()
                 return
 
@@ -2209,6 +2382,7 @@ class AppWindow:
         self.info_total_var.set(f"{attrib_total:g} / {max_total:g}")
 
     # ---------------- Launch ----------------
+
 
 def run_app() -> None:
     root = tk.Tk()
