@@ -1,0 +1,123 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  APP_NAME: "PDF Corrections"
+  ENTRYPOINT: "app/main.py"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+          - os: macos-15
+            label: macos-arm64
+          - os: macos-15-intel
+            label: macos-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # ------- Build Windows -------
+      - name: PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed `
+            --name "${{ env.APP_NAME }}" `
+            --collect-all fitz `
+            --collect-all PIL `
+            "${{ env.ENTRYPOINT }}"
+
+      - name: Package (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = "PDF_Corrections_${{ matrix.label }}.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "dist\${{ env.APP_NAME }}\*" -DestinationPath $zip
+
+      # ------- Build macOS -------
+      - name: PyInstaller (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --name "${{ env.APP_NAME }}" \
+            --collect-all fitz \
+            --collect-all PIL \
+            "${{ env.ENTRYPOINT }}"
+
+      - name: Package (macOS dmg)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          DMG="PDF_Corrections_${{ matrix.label }}.dmg"
+          rm -f "$DMG"
+          # DMG à partir du .app
+          hdiutil create -volname "${{ env.APP_NAME }}" \
+            -srcfolder "dist/${{ env.APP_NAME }}.app" \
+            -ov -format UDZO "$DMG"
+
+      # ------- Upload artifact -------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF_Corrections_${{ matrix.label }}
+          path: |
+            PDF_Corrections_${{ matrix.label }}.zip
+            PDF_Corrections_${{ matrix.label }}.dmg
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show files
+        run: ls -R artifacts
+
+      - name: Create/Update release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Crée la release si elle n'existe pas
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Build automatique ($TAG)"
+          fi
+
+          # Upload tous les .zip/.dmg
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" \) -print0 | \
+            xargs -0 -I {} gh release upload "$TAG" "{}" --clobber
