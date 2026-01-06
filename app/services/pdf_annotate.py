@@ -37,7 +37,7 @@ BASIC_COLORS = {
 }
 
 
-def default_marker_position_in_margin(margin_cm: float, y_pt: float) -> Tuple[float, float]:
+def default_marker_position_in_margin(margin_cm: float, y_pt: float):
     """Compat: centre de la marge gauche."""
     margin_pt = cm_to_pt(margin_cm)
     return (margin_pt / 2.0, y_pt)
@@ -48,13 +48,7 @@ def _resolve_color(color_any: Any, default_hex: str = "#111827") -> Tuple[float,
     color_any peut être :
     - un nom ('rouge', 'bleu', ...)
     - un hex '#RRGGBB'
-    - déjà un tuple (r,g,b) en 0..1
     """
-    if isinstance(color_any, tuple) and len(color_any) == 3:
-        try:
-            return (float(color_any[0]), float(color_any[1]), float(color_any[2]))
-        except Exception:
-            return _hex_to_rgb01(default_hex)
     if isinstance(color_any, str):
         s = color_any.strip().lower()
         if s in BASIC_COLORS:
@@ -73,17 +67,6 @@ def _norm_rect(rect: List[float]) -> fitz.Rect:
     return r
 
 
-
-
-def _insert_text_bold(page: fitz.Page, pos: Tuple[float, float], text: str, fontsize: float,
-                      color: Tuple[float, float, float], fontname: str = "helv") -> None:
-    """
-    Rendu "gras" compatible toutes versions : on dessine 2 fois le texte avec un léger décalage.
-    Évite les soucis de polices (ex: helvB introuvable selon versions).
-    """
-    page.insert_text(pos, text, fontsize=fontsize, fontname=fontname, color=color, overlay=True)
-    page.insert_text((pos[0] + 0.45, pos[1]), text, fontsize=fontsize, fontname=fontname, color=color, overlay=True)
-
 def apply_annotations(
     base_pdf: Path,
     out_pdf: Path,
@@ -92,7 +75,6 @@ def apply_annotations(
     """
     Applique les annotations:
     - score_circle: pastille (rond) + libellé bleu
-    - score_table: tableau récapitulatif (texte)
     - ink: trait main levée (polyline)
     - textbox: zone de texte (sans cadre / fond transparent)
     - arrow: flèche (ligne + tête)
@@ -106,11 +88,9 @@ def apply_annotations(
         for ann in annotations:
             if not isinstance(ann, dict):
                 continue
-            kind = ann.get("kind")
-            try:
-                page_i = int(ann.get("page", 0))
-            except Exception:
-                continue
+            kind = str(ann.get("kind") or "").strip()
+
+            page_i = int(ann.get("page", 0))
             if page_i < 0 or page_i >= doc.page_count:
                 continue
             page = doc.load_page(page_i)
@@ -123,10 +103,11 @@ def apply_annotations(
                 y = float(ann.get("y_pt", 0))
 
                 radius = float(style.get("radius_pt", 9.0))
+
                 result = str(ann.get("result", "good"))
                 fill_hex = str(style.get("fill", RESULT_COLORS.get(result, RESULT_COLORS["good"])))
-                label_text = str(ann.get("exercise_label") or ann.get("exercise_code") or "").strip()
 
+                label_text = str(ann.get("exercise_label") or ann.get("exercise_code") or "").strip()
                 label_size = float(style.get("label_fontsize", 11.0))
                 label_dx = float(style.get("label_dx_pt", radius + 6.0))
 
@@ -139,6 +120,7 @@ def apply_annotations(
                 shape.commit()
 
                 if label_text:
+                    # Texte à droite (bleu)
                     text_point = (x + label_dx, y + (label_size / 3.0))
                     page.insert_text(
                         text_point,
@@ -148,88 +130,6 @@ def apply_annotations(
                         color=blue,
                         overlay=True,
                     )
-                continue
-
-            # ---------------- Tableau récapitulatif (note) ----------------
-            if kind == "score_table":
-                try:
-                    x0 = float(ann.get("x_pt", 0.0))
-                    y0 = float(ann.get("y_pt", 0.0))
-                except Exception:
-                    x0, y0 = 0.0, 0.0
-
-                payload = ann.get("payload") or {}
-                rows = payload.get("rows") or []
-                try:
-                    total_score = float(payload.get("total_score", 0.0))
-                except Exception:
-                    total_score = 0.0
-                try:
-                    total_max = float(payload.get("total_max", 0.0))
-                except Exception:
-                    total_max = 0.0
-
-                show20 = bool(payload.get("show_on_20", False))
-                score20 = payload.get("score_20", None)
-                try:
-                    score20f = float(score20) if score20 is not None else None
-                except Exception:
-                    score20f = None
-
-                font_size = float(style.get("font_size_pt", 11.0))
-                line_h = float(style.get("line_h_pt", font_size + 3.0))
-                color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["rouge"])
-
-                y = y0
-
-                # Cadre
-                rect_any = ann.get("rect")
-                if isinstance(rect_any, list) and len(rect_any) == 4:
-                    try:
-                        rx0, ry0, rx1, ry1 = [float(v) for v in rect_any]
-                        page.draw_rect(fitz.Rect(rx0, ry0, rx1, ry1), color=color, width=1.2, overlay=True)
-                    except Exception:
-                        pass
-
-                _insert_text_bold(page, (x0, y + font_size), "Note Finale", fontsize=font_size + 1.0, color=color, fontname="helv")
-                y += line_h * 1.4
-
-                if isinstance(rows, list):
-                    for r in rows:
-                        if not isinstance(r, dict):
-                            continue
-                        code = str(r.get("code", "")).strip()
-                        if not code:
-                            continue
-                        try:
-                            a = float(r.get("attrib", 0.0))
-                        except Exception:
-                            a = 0.0
-                        try:
-                            mx = float(r.get("max", 0.0))
-                        except Exception:
-                            mx = 0.0
-                        code_disp = code
-                        if not code_disp.lower().startswith("ex"):
-                            code_disp = f"Ex{code_disp}"
-                        txt = f"{code_disp} : {a:g} / {mx:g}"
-                        page.insert_text(
-                            (x0, y + font_size),
-                            txt,
-                            fontsize=font_size,
-                            fontname="helv",
-                            color=color,
-                            overlay=True,
-                        )
-                        y += line_h
-
-                total_txt = f"Total : {total_score:g} / {total_max:g}"
-                if show20 and total_max > 0:
-                    if score20f is None:
-                        score20f = (total_score / total_max) * 20.0
-                    total_txt += f"  ({score20f:.1f}/20)"
-
-                _insert_text_bold(page, (x0, y + font_size), total_txt, fontsize=font_size, color=color, fontname="helv")
                 continue
 
             # ---------------- Main levée ----------------
@@ -251,24 +151,26 @@ def apply_annotations(
                 page.draw_polyline(points, color=color, width=width, overlay=True)
                 continue
 
-            # ---------------- Texte (sans cadre) ----------------
+            # ---------------- Zone de texte ----------------
             if kind == "textbox":
-                rect_any = ann.get("rect")
-                if not (isinstance(rect_any, list) and len(rect_any) == 4):
+                rect = ann.get("rect")
+                if not isinstance(rect, list):
                     continue
-                r = _norm_rect(rect_any)
-                text = str(ann.get("text", "") or "").strip()
+                r = _norm_rect(rect)
+                if r.is_empty or r.get_area() <= 1:
+                    continue
+                text = str(ann.get("text") or "").rstrip("\n")
                 if not text:
                     continue
                 color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
-                font_size = float(style.get("font_size_pt", 14.0))
+                fontsize = float(style.get("fontsize", 14.0))
+                # pas de cadre, pas de fond => insert_textbox suffit
                 page.insert_textbox(
                     r,
                     text,
-                    fontsize=font_size,
+                    fontsize=fontsize,
                     fontname="helv",
                     color=color,
-                    align=0,
                     overlay=True,
                 )
                 continue
@@ -279,14 +181,18 @@ def apply_annotations(
                 e = ann.get("end")
                 if not (isinstance(s, list) and isinstance(e, list) and len(s) == 2 and len(e) == 2):
                     continue
-                x0, y0 = float(s[0]), float(s[1])
-                x1, y1 = float(e[0]), float(e[1])
+                try:
+                    x0, y0 = float(s[0]), float(s[1])
+                    x1, y1 = float(e[0]), float(e[1])
+                except Exception:
+                    continue
 
                 color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
-                width = float(style.get("width_pt", 2.5))
+                width = float(style.get("width_pt", 2.0))
 
                 page.draw_line((x0, y0), (x1, y1), color=color, width=width, overlay=True)
 
+                # tête de flèche (2 traits)
                 dx = x1 - x0
                 dy = y1 - y0
                 L = math.hypot(dx, dy)

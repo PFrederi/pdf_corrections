@@ -9,7 +9,7 @@ import math
 
 from app.ui.theme import apply_dark_theme, DARK_BG, DARK_BG_2
 from app.core.project import Project
-from app.services.pdf_margin import add_left_margin, cm_to_pt
+from app.services.pdf_margin import add_left_margin
 from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
 from app.ui.widgets.pdf_viewer import PDFViewer
@@ -37,7 +37,7 @@ class AppWindow:
         self._drag_target_idx: int | None = None
 
         # Outils d'annotation classiques (Visualisation PDF)
-        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow | select | move
+        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow
         self.ann_color_var = tk.StringVar(value="bleu")  # couleur trait / flèche
         self.ann_width_var = tk.IntVar(value=3)          # épaisseur trait / flèche
 
@@ -145,57 +145,7 @@ class AppWindow:
         self._click_hint = ttk.Label(self.view_left, text="Mode clic : OFF")
         self._click_hint.pack(anchor="w", padx=10, pady=(6, 6))
     def _build_view_correction_panel(self) -> None:
-        # Panneau scrollable (la liste + options peuvent dépasser en hauteur)
-        root = ttk.Frame(self.sub_correction)
-        root.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(root, bg=DARK_BG_2, highlightthickness=0)
-        vscroll = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-
-        vscroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = ttk.Frame(canvas)
-        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def _on_inner_configure(_evt=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_configure(evt):
-            canvas.itemconfigure(inner_id, width=evt.width)
-
-        inner.bind("<Configure>", _on_inner_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
-
-        # Scroll molette uniquement quand la souris est sur le panneau
-        def _mw(evt):
-            try:
-                canvas.yview_scroll(int(-1 * (evt.delta / 120)), "units")
-            except Exception:
-                pass
-
-        def _mw_linux(evt):
-            if evt.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif evt.num == 5:
-                canvas.yview_scroll(1, "units")
-
-        def _bind_wheel(_evt=None):
-            canvas.bind_all("<MouseWheel>", _mw)
-            canvas.bind_all("<Button-4>", _mw_linux)
-            canvas.bind_all("<Button-5>", _mw_linux)
-
-        def _unbind_wheel(_evt=None):
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
-
-        canvas.bind("<Enter>", _bind_wheel)
-        canvas.bind("<Leave>", _unbind_wheel)
-
-        # Contenu réel avec marges
-        frm = ttk.Frame(inner)
+        frm = ttk.Frame(self.sub_correction)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
 
         ttk.Label(frm, text="V0 — Correction par barème").pack(anchor="w")
@@ -205,10 +155,6 @@ class AppWindow:
         # Résumé points (document courant)
         self.c_total_var = tk.StringVar(value="Total attribué : — / —")
         ttk.Label(frm, textvariable=self.c_total_var).pack(anchor="w", pady=(0, 8))
-
-        self.c_show20_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Afficher /20", variable=self.c_show20_var).pack(anchor="w", pady=(0, 10))
-        ttk.Button(frm, text="Ajouter/Mettre à jour le récapitulatif", command=self.c_upsert_score_table).pack(anchor="w", pady=(0, 10))
 
         self.c_move_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 10))
@@ -230,14 +176,7 @@ class AppWindow:
         ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(6, 8))
 
         ttk.Label(frm, text="Marques du document :").pack(anchor="w")
-        self.c_marks = tk.Listbox(
-            frm,
-            height=12,
-            bg=DARK_BG_2,
-            fg="white",
-            highlightthickness=0,
-            selectbackground="#2F81F7",
-        )
+        self.c_marks = tk.Listbox(frm, height=12, bg=DARK_BG_2, fg="white", highlightthickness=0, selectbackground="#2F81F7")
         self.c_marks.pack(fill="x", pady=(4, 8))
 
         btns = ttk.Frame(frm)
@@ -250,7 +189,6 @@ class AppWindow:
         ttk.Button(frm, text="Afficher PDF corrigé", command=self.open_current_corrected).pack(anchor="w", pady=(6, 0))
 
         self._refresh_correction_ui()
-
 
 
     def _build_view_info_panel(self) -> None:
@@ -363,7 +301,7 @@ class AppWindow:
             click_cb=self._on_pdf_click if enabled else None,
             drag_cb=self._on_pdf_drag if enabled else None,
             release_cb=self._on_pdf_release if enabled else None,
-            context_cb=self._on_pdf_context_menu if (main == "Visualisation PDF" and sub == "Correction V0" and tool == "none") else None,
+            context_cb=self._on_pdf_context_menu if enabled else None,
         )
 
         if hasattr(self, "_click_hint"):
@@ -469,12 +407,6 @@ class AppWindow:
             set_state(self._ann_text_entry, False)
             set_state(self._text_color_combo, False)
             set_state(self._text_size_spin, False)
-        elif tool == "move":
-            set_state(self._ann_color_combo, False)
-            set_state(self._ann_width_spin, False)
-            set_state(self._ann_text_entry, False)
-            set_state(self._text_color_combo, False)
-            set_state(self._text_size_spin, False)
         else:
             set_state(self._ann_color_combo, False)
             set_state(self._ann_width_spin, False)
@@ -502,266 +434,12 @@ class AppWindow:
         self._draw_points = []
         self._draw_start = None
         self._draw_end = None
-        # déplacement (select)
-        self._sel_drag_id = None
-        self._sel_drag_page = None
-        self._sel_drag_click = None
-        self._sel_drag_origin = None
-        self._sel_drag_moved = False
-        # déplacement (move)
-        self._move_drag_id = None
-        self._move_drag_page = None
-        self._move_drag_click = None
-        self._move_drag_origin = None
-        self._move_drag_moved = False
 
     # ---------------- Sélection / suppression d'annotations ----------------
     def _update_selection_info(self) -> None:
         n = len(self._selected_ann_ids)
         self._sel_info_var.set(f"Sélection : {n}")
         self._update_annot_toolbar_state()
-
-
-
-
-    def _start_sel_drag(self, ann_id: str | None, page_index: int, x_pt: float, y_pt: float) -> None:
-        """Démarre un déplacement (mode select) pour certaines annotations (score_table, score_circle)."""
-        # reset
-        self._sel_drag_id = None
-        self._sel_drag_page = None
-        self._sel_drag_click = None
-        self._sel_drag_origin = None
-        self._sel_drag_moved = False
-
-        if not ann_id:
-            return
-        # On ne déplace que si 1 sélection (plus simple V0)
-        if len(self._selected_ann_ids) != 1 or ann_id not in self._selected_ann_ids:
-            return
-
-        anns = self._annotations_for_current_doc()
-        ann = next((a for a in anns if isinstance(a, dict) and str(a.get("id", "")) == ann_id), None)
-        if not ann:
-            return
-        kind = ann.get("kind")
-        if kind not in ("score_table", "score_circle"):
-            return
-
-        self._sel_drag_id = ann_id
-        self._sel_drag_page = int(page_index)
-        self._sel_drag_click = (float(x_pt), float(y_pt))
-
-        if kind == "score_circle":
-            self._sel_drag_origin = ("score_circle", float(ann.get("x_pt", 0.0)), float(ann.get("y_pt", 0.0)))
-        elif kind == "score_table":
-            x0 = float(ann.get("x_pt", 0.0))
-            y0 = float(ann.get("y_pt", 0.0))
-            rect = ann.get("rect")
-            self._sel_drag_origin = ("score_table", x0, y0, rect)
-
-    def _move_sel_drag(self, x_pt: float, y_pt: float) -> None:
-        if not self._sel_drag_id or not self._sel_drag_click or not self._sel_drag_origin:
-            return
-        cx, cy = self._sel_drag_click
-        dx = float(x_pt) - float(cx)
-        dy = float(y_pt) - float(cy)
-
-        anns = self._annotations_for_current_doc()
-        ann = next((a for a in anns if isinstance(a, dict) and str(a.get("id", "")) == self._sel_drag_id), None)
-        if not ann:
-            return
-
-        kind0 = self._sel_drag_origin[0]
-        if kind0 == "score_circle":
-            _, ox, oy = self._sel_drag_origin
-            ann["x_pt"] = float(ox) + dx
-            ann["y_pt"] = float(oy) + dy
-            self._sel_drag_moved = True
-            return
-
-        if kind0 == "score_table":
-            _, ox, oy, rect0 = self._sel_drag_origin
-            ann["x_pt"] = float(ox) + dx
-            ann["y_pt"] = float(oy) + dy
-            if isinstance(rect0, list) and len(rect0) == 4:
-                try:
-                    x0, y0, x1, y1 = [float(v) for v in rect0]
-                    ann["rect"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
-                except Exception:
-                    pass
-            self._sel_drag_moved = True
-            return
-
-    def _end_sel_drag(self) -> None:
-        if not self._sel_drag_id:
-            return
-        try:
-            moved = bool(self._sel_drag_moved)
-        except Exception:
-            moved = False
-
-        # clear state
-        self._sel_drag_id = None
-        self._sel_drag_page = None
-        self._sel_drag_click = None
-        self._sel_drag_origin = None
-        self._sel_drag_moved = False
-
-        if not moved:
-            return
-        if not self.project:
-            return
-        self.project.save()
-        self.c_regenerate()
-        self._refresh_files_list()
-        self._refresh_info_panel()
-        self._refresh_correction_totals()
-
-    def _start_move_drag(self, ann_id: str | None, page_index: int, x_pt: float, y_pt: float) -> None:
-        """Démarre un déplacement (outil 'Déplacer') pour une annotation sélectionnée."""
-        self._move_drag_id = None
-        self._move_drag_page = None
-        self._move_drag_click = None
-        self._move_drag_origin = None
-        self._move_drag_moved = False
-
-        if not ann_id:
-            return
-        if len(self._selected_ann_ids) != 1 or ann_id not in self._selected_ann_ids:
-            return
-
-        anns = self._annotations_for_current_doc()
-        ann = next((a for a in anns if isinstance(a, dict) and str(a.get("id", "")) == ann_id), None)
-        if not ann:
-            return
-
-        kind = ann.get("kind")
-        self._move_drag_id = ann_id
-        self._move_drag_page = int(page_index)
-        self._move_drag_click = (float(x_pt), float(y_pt))
-
-        if kind == "score_circle":
-            self._move_drag_origin = ("score_circle", float(ann.get("x_pt", 0.0)), float(ann.get("y_pt", 0.0)))
-        elif kind == "score_table":
-            x0 = float(ann.get("x_pt", 0.0))
-            y0 = float(ann.get("y_pt", 0.0))
-            rect = ann.get("rect")
-            rect_copy = list(rect) if isinstance(rect, list) else None
-            self._move_drag_origin = ("score_table", x0, y0, rect_copy)
-        elif kind == "arrow":
-            s = ann.get("start")
-            e = ann.get("end")
-            s0 = list(s) if isinstance(s, list) else None
-            e0 = list(e) if isinstance(e, list) else None
-            self._move_drag_origin = ("arrow", s0, e0)
-        elif kind == "textbox":
-            r = ann.get("rect")
-            r0 = list(r) if isinstance(r, list) else None
-            self._move_drag_origin = ("textbox", r0)
-        elif kind == "ink":
-            pts = ann.get("points")
-            pts0 = [list(p) for p in pts] if isinstance(pts, list) else None
-            self._move_drag_origin = ("ink", pts0)
-        else:
-            # kind inconnu -> pas déplaçable (V0)
-            self._move_drag_id = None
-            self._move_drag_page = None
-            self._move_drag_click = None
-            self._move_drag_origin = None
-            self._move_drag_moved = False
-
-
-    def _move_move_drag(self, x_pt: float, y_pt: float) -> None:
-        if not self._move_drag_id or not self._move_drag_click or not self._move_drag_origin:
-            return
-        cx, cy = self._move_drag_click
-        dx = float(x_pt) - float(cx)
-        dy = float(y_pt) - float(cy)
-
-        anns = self._annotations_for_current_doc()
-        ann = next((a for a in anns if isinstance(a, dict) and str(a.get("id", "")) == self._move_drag_id), None)
-        if not ann:
-            return
-
-        kind0 = self._move_drag_origin[0]
-
-        if kind0 == "score_circle":
-            _, ox, oy = self._move_drag_origin
-            ann["x_pt"] = float(ox) + dx
-            ann["y_pt"] = float(oy) + dy
-            self._move_drag_moved = True
-            return
-
-        if kind0 == "score_table":
-            _, ox, oy, rect0 = self._move_drag_origin
-            ann["x_pt"] = float(ox) + dx
-            ann["y_pt"] = float(oy) + dy
-            if isinstance(rect0, list) and len(rect0) == 4:
-                try:
-                    x0, y0, x1, y1 = [float(v) for v in rect0]
-                    ann["rect"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
-                except Exception:
-                    pass
-            self._move_drag_moved = True
-            return
-
-        if kind0 == "arrow":
-            _, s0, e0 = self._move_drag_origin
-            if isinstance(s0, list) and isinstance(e0, list) and len(s0) == 2 and len(e0) == 2:
-                ann["start"] = [float(s0[0]) + dx, float(s0[1]) + dy]
-                ann["end"] = [float(e0[0]) + dx, float(e0[1]) + dy]
-                self._move_drag_moved = True
-            return
-
-        if kind0 == "textbox":
-            _, r0 = self._move_drag_origin
-            if isinstance(r0, list) and len(r0) == 4:
-                try:
-                    x0, y0, x1, y1 = [float(v) for v in r0]
-                    ann["rect"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
-                    self._move_drag_moved = True
-                except Exception:
-                    pass
-            return
-
-        if kind0 == "ink":
-            _, pts0 = self._move_drag_origin
-            if isinstance(pts0, list) and pts0:
-                pts_new = []
-                for p in pts0:
-                    if isinstance(p, list) and len(p) == 2:
-                        try:
-                            pts_new.append([float(p[0]) + dx, float(p[1]) + dy])
-                        except Exception:
-                            pass
-                if pts_new:
-                    ann["points"] = pts_new
-                    self._move_drag_moved = True
-            return
-
-
-    def _end_move_drag(self) -> None:
-        if not getattr(self, "_move_drag_id", None):
-            return
-
-        moved = bool(getattr(self, "_move_drag_moved", False))
-
-        # reset state
-        self._move_drag_id = None
-        self._move_drag_page = None
-        self._move_drag_click = None
-        self._move_drag_origin = None
-        self._move_drag_moved = False
-
-        if not moved or not self.project:
-            return
-
-        self.project.save()
-        self.c_regenerate()
-        self._refresh_files_list()
-        self._refresh_info_panel()
-        self._refresh_correction_totals()
-
 
     def ann_clear_selection(self) -> None:
         self._selected_ann_ids.clear()
@@ -785,7 +463,7 @@ class AppWindow:
         self._refresh_info_panel()
         self._refresh_correction_totals()
 
-    def _select_annotation_at(self, page_index: int, x_pt: float, y_pt: float) -> str | None:
+    def _select_annotation_at(self, page_index: int, x_pt: float, y_pt: float) -> None:
         if not self._require_doc():
             return
 
@@ -817,8 +495,6 @@ class AppWindow:
         if hasattr(self, "_click_hint"):
             self._click_hint.configure(text=f"Mode clic : ON • sélection : {len(self._selected_ann_ids)}")
 
-        return best_id
-
     def _hit_test_ann(self, ann: Any, page_index: int, x_pt: float, y_pt: float) -> float | None:
         """Distance (petit=proche) si le point touche l'annotation, sinon None."""
         if not isinstance(ann, dict):
@@ -838,23 +514,6 @@ class AppWindow:
                 return None
             d = math.hypot(x_pt - ax, y_pt - ay)
             return d if d <= (r + 10.0) else None
-
-        # Tableau récapitulatif : rect
-        if kind == "score_table":
-            rect = ann.get("rect")
-            if isinstance(rect, list) and len(rect) == 4:
-                try:
-                    x0, y0, x1, y1 = [float(v) for v in rect]
-                except Exception:
-                    return None
-                pad = 10.0
-                if (x0 - pad) <= x_pt <= (x1 + pad) and (y0 - pad) <= y_pt <= (y1 + pad):
-                    return 0.0
-                dx = 0.0 if x0 <= x_pt <= x1 else min(abs(x_pt - x0), abs(x_pt - x1))
-                dy = 0.0 if y0 <= y_pt <= y1 else min(abs(y_pt - y0), abs(y_pt - y1))
-                d = math.hypot(dx, dy)
-                return d if d <= pad else None
-            return None
 
         # Zone de texte : rect
         if kind == "textbox":
@@ -935,18 +594,13 @@ class AppWindow:
         tool = self.ann_tool_var.get()
         if tool != "none":
             if not self._require_doc():
-                return None
+                return
             self._draw_kind = tool
             self._draw_page = int(page_index)
             if tool == "select":
-                ann_id = self._select_annotation_at(page_index, x_pt, y_pt)
-                self._start_sel_drag(ann_id, page_index, x_pt, y_pt)
+                self._select_annotation_at(page_index, x_pt, y_pt)
                 return
 
-            if tool == "move":
-                ann_id = self._select_annotation_at(page_index, x_pt, y_pt)
-                self._start_move_drag(ann_id, page_index, x_pt, y_pt)
-                return
 
             if tool == "ink":
                 self._draw_points = [(float(x_pt), float(y_pt))]
@@ -971,18 +625,6 @@ class AppWindow:
         tool = self.ann_tool_var.get()
         if tool != "none":
             if self._draw_page is None or int(page_index) != int(self._draw_page):
-                return
-
-            if self._draw_kind == "select":
-                if self._sel_drag_page is None or int(page_index) != int(self._sel_drag_page):
-                    return
-                self._move_sel_drag(x_pt, y_pt)
-                return
-
-            if self._draw_kind == "move":
-                if self._move_drag_page is None or int(page_index) != int(self._move_drag_page):
-                    return
-                self._move_move_drag(x_pt, y_pt)
                 return
 
             if self._draw_kind == "ink":
@@ -1016,16 +658,6 @@ class AppWindow:
                 return
 
             if self._draw_page is None or int(page_index) != int(self._draw_page):
-                self._reset_draw_state()
-                return
-
-            if tool == "select":
-                self._end_sel_drag()
-                self._reset_draw_state()
-                return
-
-            if tool == "move":
-                self._end_move_drag()
                 self._reset_draw_state()
                 return
 
@@ -1766,192 +1398,6 @@ class AppWindow:
             else:
                 self.c_marks.insert(tk.END, f"p{page+1} • {code} • {res} • {pts:g}")
 
-    def c_delete_selected(self) -> None:
-        """
-        Supprime la marque (pastille) sélectionnée dans la liste "Marques du document".
-        (Ne supprime que les annotations kind == score_circle.)
-        """
-        if not hasattr(self, "c_marks"):
-            return
-        if not self._require_doc():
-            return
-        sel = self.c_marks.curselection()
-        if not sel:
-            return
-
-        idx = int(sel[0])
-        anns = self._annotations_for_current_doc()
-        score_idxs = [i for i, a in enumerate(anns) if isinstance(a, dict) and a.get("kind") == "score_circle"]
-        if idx < 0 or idx >= len(score_idxs):
-            return
-
-        del anns[score_idxs[idx]]
-        assert self.project is not None
-        self.project.save()
-
-        self.c_regenerate()
-        self._refresh_marks_list()
-        self._refresh_files_list()
-        self._refresh_info_panel()
-        self._refresh_correction_totals()
-
-    def c_delete_last(self) -> None:
-        """
-        Supprime la dernière pastille (score_circle) du document courant.
-        """
-        if not self._require_doc():
-            return
-        anns = self._annotations_for_current_doc()
-        # On cherche la dernière pastille
-        for i in range(len(anns) - 1, -1, -1):
-            a = anns[i]
-            if isinstance(a, dict) and a.get("kind") == "score_circle":
-                del anns[i]
-                break
-        else:
-            return
-
-        assert self.project is not None
-        self.project.save()
-
-        self.c_regenerate()
-        self._refresh_marks_list()
-        self._refresh_files_list()
-        self._refresh_info_panel()
-        self._refresh_correction_totals()
-
-
-    def c_upsert_score_table(self) -> None:
-        """Ajoute ou met à jour un tableau récapitulatif (page 1, dans la marge)."""
-        if not self._require_doc():
-            return
-        assert self.project is not None
-        doc = self.project.get_current_doc()
-        assert doc is not None
-
-        scheme = self._scheme()
-        anns = self._annotations_for_current_doc()
-
-        # Points attribués par exercice (racine n)
-        attrib_by_ex: dict[str, float] = {}
-        for a in anns:
-            if not isinstance(a, dict):
-                continue
-            if a.get("kind") != "score_circle":
-                continue
-            code = str(a.get("exercise_code") or "").strip()
-            if not code:
-                continue
-            ex_code = code.split(".")[0]
-            try:
-                pts = float(a.get("points", 0.0))
-            except Exception:
-                pts = 0.0
-            attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
-
-        # Max par exercice = somme des 'good' des feuilles sous cet exercice
-        def _sum_good(node) -> float:
-            if getattr(node, "children", None):
-                s = 0.0
-                for c in node.children:
-                    s += _sum_good(c)
-                return s
-            # feuille
-            rub = getattr(node, "rubric", None)
-            if rub is None:
-                return 0.0
-            try:
-                return float(rub.good)
-            except Exception:
-                return 0.0
-
-        rows: list[dict] = []
-        total_score = 0.0
-        total_max = 0.0
-        for ex in scheme.exercises:
-            code = str(ex.code)
-            mx = float(_sum_good(ex))
-            at = float(attrib_by_ex.get(code, 0.0))
-            rows.append({"code": code, "label": ex.label, "attrib": at, "max": mx})
-            total_score += at
-            total_max += mx
-
-        show20 = bool(getattr(self, "c_show20_var", tk.BooleanVar(value=False)).get())
-        score20 = None
-        if show20 and total_max > 0:
-            score20 = (total_score / total_max) * 20.0
-
-        payload = {
-            "rows": rows,
-            "total_score": total_score,
-            "total_max": total_max,
-            "show_on_20": show20,
-            "score_20": score20,
-        }
-
-        # dimensions approx pour hit-test / déplacement
-        font_size = 13.0
-        line_h = font_size + 4.0
-        n_lines = 1 + len(rows) + 1
-        height = n_lines * line_h + 8.0
-        width = 190.0
-
-        # placement auto dans la marge (page 1)
-        left_margin_cm = float(self.project.settings.get("left_margin_cm", 5.0))
-        margin_pt = cm_to_pt(left_margin_cm)
-        x0 = 10.0
-        # si la marge est plus petite, on se cale au centre
-        if margin_pt > 30:
-            x0 = min(10.0, max(6.0, margin_pt - width - 6.0))
-        y0 = 40.0
-
-        # upsert : un seul score_table par document
-        existing = None
-        for a in anns:
-            if isinstance(a, dict) and a.get("kind") == "score_table":
-                existing = a
-                break
-
-        if existing:
-            # garde la position actuelle
-            try:
-                x0 = float(existing.get("x_pt", x0))
-                y0 = float(existing.get("y_pt", y0))
-            except Exception:
-                pass
-            existing["page"] = 0
-            existing["x_pt"] = x0
-            existing["y_pt"] = y0
-            existing["payload"] = payload
-            existing.setdefault("style", {})
-            existing["style"].update({
-                "font_size_pt": font_size,
-                "line_h_pt": line_h,
-                "color": "rouge",
-            })
-            existing["rect"] = [x0, y0, x0 + width, y0 + height]
-        else:
-            ann = {
-                "id": str(uuid.uuid4()),
-                "kind": "score_table",
-                "page": 0,
-                "x_pt": x0,
-                "y_pt": y0,
-                "rect": [x0, y0, x0 + width, y0 + height],
-                "style": {
-                    "font_size_pt": font_size,
-                    "line_h_pt": line_h,
-                    "color": "rouge",
-                },
-                "payload": payload,
-            }
-            anns.append(ann)
-
-        self.project.save()
-        self.c_regenerate()
-        self._refresh_files_list()
-        self._refresh_info_panel()
-        self._refresh_correction_totals()
 
     def _scheme_max_total(self) -> float:
         if not self.project:
@@ -2029,7 +1475,6 @@ class AppWindow:
         if best_d2 is not None and best_d2 <= threshold_pt*threshold_pt:
             return best_idx, best_ann
         return None, None
-
     def _on_pdf_click_for_correction(self, page_index: int, x_pt: float, y_pt: float) -> None:
         # Mode déplacement
         if hasattr(self, "c_move_var") and self.c_move_var.get():
@@ -2144,7 +1589,6 @@ class AppWindow:
 
         if hasattr(self, "_click_hint"):
             self._click_hint.configure(text="Mode clic : ON • déplacement terminé")
-
 
 
     def _add_score_circle_at(self, page_index: int, x_pt: float, y_pt: float, code: str, label: str, result: str) -> None:
@@ -2270,120 +1714,152 @@ class AppWindow:
 
 
 
-    def c_regenerate(self) -> None:
-        if not self._require_doc():
-            return
-        assert self.project is not None
-        doc = self.project.get_current_doc()
-        assert doc is not None
+        def c_regenerate(self) -> None:
+            if not self._require_doc():
+                return
+            assert self.project is not None
+            doc = self.project.get_current_doc()
+            assert doc is not None
 
-        if "margin" not in doc.variants:
-            self._ensure_project_margins()
-        if "margin" not in doc.variants:
-            messagebox.showwarning("Correction", "Impossible de trouver / créer la variante 'margin'.")
-            return
+            if "margin" not in doc.variants:
+                self._ensure_project_margins()
+            if "margin" not in doc.variants:
+                messagebox.showwarning("Correction", "Impossible de trouver / créer la variante 'margin'.")
+                return
 
-        base_pdf = self.project.rel_to_abs(doc.variants["margin"])
-        if not base_pdf.exists():
-            messagebox.showwarning("Correction", "PDF marge introuvable.")
-            return
+            base_pdf = self.project.rel_to_abs(doc.variants["margin"])
+            if not base_pdf.exists():
+                messagebox.showwarning("Correction", "PDF marge introuvable.")
+                return
 
-        anns = self._annotations_for_current_doc()
-        out_pdf = self.project.unique_work_path(f"{doc.id}__corrected.pdf")
-        try:
-            apply_annotations(base_pdf, out_pdf, anns)
-        except Exception as e:
-            messagebox.showerror("Correction", f"Erreur génération corrigé.\n\n{e}")
-            return
-
-        doc.variants["corrected"] = self.project.abs_to_rel(out_pdf)
-        self.project.current_variant = "corrected"
-        self.project.save()
-
-        self.viewer.open_pdf(out_pdf)
-
-    def _refresh_info_panel(self) -> None:
-        if not hasattr(self, "info_tree"):
-            return
-
-        for iid in self.info_tree.get_children(""):
-            self.info_tree.delete(iid)
-
-        if not self.project:
-            self.info_doc_var.set("Document : —")
-            self.info_total_var.set("— / —")
-            return
-
-        scheme = self._scheme()
-
-        def total_good(node) -> float:
-            if node.children:
-                return sum(total_good(c) for c in node.children)
-            if node.level() in (1, 2):
-                if node.rubric:
-                    return float(node.rubric.good)
-                return 1.0
-            return 0.0
-
-        max_by_ex: dict[str, float] = {}
-        label_by_ex: dict[str, str] = {}
-        for ex in scheme.exercises:
-            ex_code = ex.code
-            max_by_ex[ex_code] = float(total_good(ex))
-            label_by_ex[ex_code] = ex.label or f"Exercice {ex_code}"
-
-        max_total = sum(max_by_ex.values())
-
-        doc = self.project.get_current_doc()
-        if not doc:
-            self.info_doc_var.set("Document : — (aucun sélectionné)")
-            for ex_code in sorted(max_by_ex.keys(), key=lambda s: int(s) if s.isdigit() else 9999):
-                self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
-                                      values=("", f"{max_by_ex[ex_code]:g}"))
-            self.info_total_var.set(f"— / {max_total:g}")
-            return
-
-        self.info_doc_var.set(f"Document : {doc.original_name}")
-
-        ann = self.project.settings.get("annotations", {})
-        anns = ann.get(doc.id, []) if isinstance(ann, dict) else []
-
-        attrib_by_ex: dict[str, float] = {k: 0.0 for k in max_by_ex.keys()}
-        if isinstance(anns, list):
-            for a in anns:
-                if not isinstance(a, dict):
-                    continue
-                if a.get("kind") != "score_circle":
-                    continue
-                code = str(a.get("exercise_code", "")).strip()
-                if not code:
-                    continue
-                ex_code = code.split(".", 1)[0]
-                try:
-                    pts = float(a.get("points", 0.0))
-                except Exception:
-                    pts = 0.0
-                attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
-
-        attrib_total = sum(attrib_by_ex.values())
-
-        def sort_key_ex(s: str):
+            anns = self._annotations_for_current_doc()
+            out_pdf = self.project.unique_work_path(f"{doc.id}__corrected.pdf")
             try:
-                return int(s)
-            except Exception:
-                return 9999
+                apply_annotations(base_pdf, out_pdf, anns)
+            except Exception as e:
+                messagebox.showerror("Correction", f"Erreur génération corrigé.\n\n{e}")
+                return
 
-        for ex_code in sorted(max_by_ex.keys(), key=sort_key_ex):
-            attrib = attrib_by_ex.get(ex_code, 0.0)
-            mx = max_by_ex.get(ex_code, 0.0)
-            self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
-                                  values=(f"{attrib:g}", f"{mx:g}"))
+            doc.variants["corrected"] = self.project.abs_to_rel(out_pdf)
+            self.project.current_variant = "corrected"
+            self.project.save()
 
-        self.info_total_var.set(f"{attrib_total:g} / {max_total:g}")
+            self.viewer.open_pdf(out_pdf)
 
-    # ---------------- Launch ----------------
+        def c_delete_last(self) -> None:
+            if not self._require_doc():
+                return
+            anns = self._annotations_for_current_doc()
+            if not anns:
+                return
+            anns.pop()
+            assert self.project is not None
+            self.project.save()
+            self.c_regenerate()
+            self._refresh_marks_list()
+            self._refresh_files_list()
+            self._refresh_info_panel()
 
+        def c_delete_selected(self) -> None:
+            if not self._require_doc():
+                return
+            sel = self.c_marks.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            anns = self._annotations_for_current_doc()
+            score_idxs = [i for i, a in enumerate(anns) if a.get("kind") == "score_circle"]
+            if idx < 0 or idx >= len(score_idxs):
+                return
+            del anns[score_idxs[idx]]
+            assert self.project is not None
+            self.project.save()
+            self.c_regenerate()
+            self._refresh_marks_list()
+            self._refresh_files_list()
+            self._refresh_info_panel()
 
+        # ---------------- Infos : points attribués / max ----------------
+        def _refresh_info_panel(self) -> None:
+            if not hasattr(self, "info_tree"):
+                return
+
+            for iid in self.info_tree.get_children(""):
+                self.info_tree.delete(iid)
+
+            if not self.project:
+                self.info_doc_var.set("Document : —")
+                self.info_total_var.set("— / —")
+                return
+
+            scheme = self._scheme()
+
+            def total_good(node) -> float:
+                if node.children:
+                    return sum(total_good(c) for c in node.children)
+                if node.level() in (1, 2):
+                    if node.rubric:
+                        return float(node.rubric.good)
+                    return 1.0
+                return 0.0
+
+            max_by_ex: dict[str, float] = {}
+            label_by_ex: dict[str, str] = {}
+            for ex in scheme.exercises:
+                ex_code = ex.code
+                max_by_ex[ex_code] = float(total_good(ex))
+                label_by_ex[ex_code] = ex.label or f"Exercice {ex_code}"
+
+            max_total = sum(max_by_ex.values())
+
+            doc = self.project.get_current_doc()
+            if not doc:
+                self.info_doc_var.set("Document : — (aucun sélectionné)")
+                for ex_code in sorted(max_by_ex.keys(), key=lambda s: int(s) if s.isdigit() else 9999):
+                    self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
+                                          values=("", f"{max_by_ex[ex_code]:g}"))
+                self.info_total_var.set(f"— / {max_total:g}")
+                return
+
+            self.info_doc_var.set(f"Document : {doc.original_name}")
+
+            ann = self.project.settings.get("annotations", {})
+            anns = ann.get(doc.id, []) if isinstance(ann, dict) else []
+
+            attrib_by_ex: dict[str, float] = {k: 0.0 for k in max_by_ex.keys()}
+            if isinstance(anns, list):
+                for a in anns:
+                    if not isinstance(a, dict):
+                        continue
+                    if a.get("kind") != "score_circle":
+                        continue
+                    code = str(a.get("exercise_code", "")).strip()
+                    if not code:
+                        continue
+                    ex_code = code.split(".", 1)[0]
+                    try:
+                        pts = float(a.get("points", 0.0))
+                    except Exception:
+                        pts = 0.0
+                    attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
+
+            attrib_total = sum(attrib_by_ex.values())
+
+            def sort_key_ex(s: str):
+                try:
+                    return int(s)
+                except Exception:
+                    return 9999
+
+            for ex_code in sorted(max_by_ex.keys(), key=sort_key_ex):
+                attrib = attrib_by_ex.get(ex_code, 0.0)
+                mx = max_by_ex.get(ex_code, 0.0)
+                self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
+                                      values=(f"{attrib:g}", f"{mx:g}"))
+
+            self.info_total_var.set(f"{attrib_total:g} / {max_total:g}")
+
+        # ---------------- Launch ----------------
 def run_app() -> None:
     root = tk.Tk()
     AppWindow(root)
