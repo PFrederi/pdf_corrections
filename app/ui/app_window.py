@@ -401,49 +401,122 @@ class AppWindow:
 
         self._update_annot_toolbar_state()
 
+
+
+    def _sync_tool_combo_from_var(self) -> None:
+        """Synchronise la combobox d'outils (UI) avec self.ann_tool_var (logique).
+
+        Méthode robuste : peut être appelée avant la construction complète des widgets.
+        """
+        tool_var = getattr(self, "ann_tool_var", None)
+        current = tool_var.get() if tool_var is not None else "none"
+
+        tool_map = getattr(self, "_tool_map", None) or []
+        label = None
+        for lbl, v in tool_map:
+            if v == current:
+                label = lbl
+                break
+
+        if label is None:
+            label = tool_map[0][0] if tool_map else "Aucun"
+
+        if hasattr(self, "_tool_label_var"):
+            try:
+                self._tool_label_var.set(label)
+            except Exception:
+                pass
+        elif hasattr(self, "_tool_combo"):
+            try:
+                self._tool_combo.set(label)
+            except Exception:
+                pass
+
+    def _on_tool_combo(self) -> None:
+        """Callback quand l'utilisateur change l'outil dans la combobox."""
+        tool_map = getattr(self, "_tool_map", None) or []
+
+        selected_label = ""
+        if hasattr(self, "_tool_label_var"):
+            try:
+                selected_label = self._tool_label_var.get()
+            except Exception:
+                selected_label = ""
+
+        selected_val = "none"
+        for lbl, v in tool_map:
+            if lbl == selected_label:
+                selected_val = v
+                break
+
+        if hasattr(self, "ann_tool_var"):
+            try:
+                self.ann_tool_var.set(selected_val)
+            except Exception:
+                pass
+
+        # Les trace_add déclenchent déjà les refresh, mais on sécurise :
+        try:
+            self._update_annot_toolbar_state()
+        except Exception:
+            pass
+        try:
+            self._update_click_mode()
+        except Exception:
+            pass
+
     def _update_annot_toolbar_state(self) -> None:
-        """Active/désactive certains contrôles selon l'outil sélectionné."""
-        tool = self.ann_tool_var.get()
+        """Active/désactive certains contrôles selon l'outil sélectionné.
+
+        Robustesse :
+        - Peut être appelé avant la création complète des widgets.
+        - Ignore proprement les widgets absents.
+        """
+        tool_var = getattr(self, "ann_tool_var", None)
+        tool = tool_var.get() if tool_var is not None else "none"
 
         def set_state(widget, enabled: bool):
+            if widget is None:
+                return
             try:
                 widget.configure(state=("normal" if enabled else "disabled"))
             except Exception:
                 pass
 
-        
-        if tool in ("ink", "arrow"):
-            set_state(self._ann_color_combo, True)
-            set_state(self._ann_width_spin, True)
-            set_state(self._ann_text_entry, False)
-            set_state(self._text_color_combo, False)
-            set_state(self._text_size_spin, False)
-        elif tool == "textbox":
-            set_state(self._ann_color_combo, False)
-            set_state(self._ann_width_spin, False)
-            set_state(self._ann_text_entry, True)
-            set_state(self._text_color_combo, True)
-            set_state(self._text_size_spin, True)
-        elif tool == "select":
-            set_state(self._ann_color_combo, False)
-            set_state(self._ann_width_spin, False)
-            set_state(self._ann_text_entry, False)
-            set_state(self._text_color_combo, False)
-            set_state(self._text_size_spin, False)
-        else:
-            set_state(self._ann_color_combo, False)
-            set_state(self._ann_width_spin, False)
-            set_state(self._ann_text_entry, False)
-            set_state(self._text_color_combo, False)
-            set_state(self._text_size_spin, False)
+        ann_color = getattr(self, "_ann_color_combo", None)
+        ann_width = getattr(self, "_ann_width_spin", None)
+        ann_text = getattr(self, "_ann_text_entry", None)
+        txt_color = getattr(self, "_text_color_combo", None)
+        txt_size = getattr(self, "_text_size_spin", None)
 
-        # Boutons de sélection
+        if tool in ("ink", "arrow"):
+            set_state(ann_color, True)
+            set_state(ann_width, True)
+            set_state(ann_text, False)
+            set_state(txt_color, False)
+            set_state(txt_size, False)
+        elif tool == "textbox":
+            set_state(ann_color, False)
+            set_state(ann_width, False)
+            set_state(ann_text, True)
+            set_state(txt_color, True)
+            set_state(txt_size, True)
+        elif tool in ("select", "move"):
+            set_state(ann_color, False)
+            set_state(ann_width, False)
+            set_state(ann_text, False)
+            set_state(txt_color, False)
+            set_state(txt_size, False)
+        else:
+            set_state(ann_color, False)
+            set_state(ann_width, False)
+            set_state(ann_text, False)
+            set_state(txt_color, False)
+            set_state(txt_size, False)
+
         has_sel = bool(getattr(self, "_selected_ann_ids", set()))
-        try:
-            self._btn_del_sel.configure(state=("normal" if has_sel else "disabled"))
-            self._btn_clear_sel.configure(state=("normal" if has_sel else "disabled"))
-        except Exception:
-            pass
+        set_state(getattr(self, "_btn_del_sel", None), has_sel)
+        set_state(getattr(self, "_btn_clear_sel", None), has_sel)
 
     def _color_hex(self, name: str, default_name: str = "bleu") -> str:
         key = (name or "").strip().lower()
