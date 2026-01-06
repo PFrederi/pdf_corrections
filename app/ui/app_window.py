@@ -1714,152 +1714,155 @@ class AppWindow:
 
 
 
-        def c_regenerate(self) -> None:
-            if not self._require_doc():
-                return
-            assert self.project is not None
-            doc = self.project.get_current_doc()
-            assert doc is not None
-
-            if "margin" not in doc.variants:
-                self._ensure_project_margins()
-            if "margin" not in doc.variants:
-                messagebox.showwarning("Correction", "Impossible de trouver / créer la variante 'margin'.")
-                return
-
-            base_pdf = self.project.rel_to_abs(doc.variants["margin"])
-            if not base_pdf.exists():
-                messagebox.showwarning("Correction", "PDF marge introuvable.")
-                return
-
-            anns = self._annotations_for_current_doc()
-            out_pdf = self.project.unique_work_path(f"{doc.id}__corrected.pdf")
-            try:
-                apply_annotations(base_pdf, out_pdf, anns)
-            except Exception as e:
-                messagebox.showerror("Correction", f"Erreur génération corrigé.\n\n{e}")
-                return
-
-            doc.variants["corrected"] = self.project.abs_to_rel(out_pdf)
-            self.project.current_variant = "corrected"
-            self.project.save()
-
-            self.viewer.open_pdf(out_pdf)
-
-        def c_delete_last(self) -> None:
-            if not self._require_doc():
-                return
-            anns = self._annotations_for_current_doc()
-            if not anns:
-                return
-            anns.pop()
-            assert self.project is not None
-            self.project.save()
-            self.c_regenerate()
-            self._refresh_marks_list()
-            self._refresh_files_list()
-            self._refresh_info_panel()
-
-        def c_delete_selected(self) -> None:
-            if not self._require_doc():
-                return
-            sel = self.c_marks.curselection()
-            if not sel:
-                return
-            idx = sel[0]
-            anns = self._annotations_for_current_doc()
-            score_idxs = [i for i, a in enumerate(anns) if a.get("kind") == "score_circle"]
-            if idx < 0 or idx >= len(score_idxs):
-                return
-            del anns[score_idxs[idx]]
-            assert self.project is not None
-            self.project.save()
-            self.c_regenerate()
-            self._refresh_marks_list()
-            self._refresh_files_list()
-            self._refresh_info_panel()
-
-        # ---------------- Infos : points attribués / max ----------------
-        def _refresh_info_panel(self) -> None:
-            if not hasattr(self, "info_tree"):
-                return
-
-            for iid in self.info_tree.get_children(""):
-                self.info_tree.delete(iid)
-
-            if not self.project:
-                self.info_doc_var.set("Document : —")
-                self.info_total_var.set("— / —")
-                return
-
-            scheme = self._scheme()
-
-            def total_good(node) -> float:
-                if node.children:
-                    return sum(total_good(c) for c in node.children)
-                if node.level() in (1, 2):
-                    if node.rubric:
-                        return float(node.rubric.good)
-                    return 1.0
-                return 0.0
-
-            max_by_ex: dict[str, float] = {}
-            label_by_ex: dict[str, str] = {}
-            for ex in scheme.exercises:
-                ex_code = ex.code
-                max_by_ex[ex_code] = float(total_good(ex))
-                label_by_ex[ex_code] = ex.label or f"Exercice {ex_code}"
-
-            max_total = sum(max_by_ex.values())
-
-            doc = self.project.get_current_doc()
-            if not doc:
-                self.info_doc_var.set("Document : — (aucun sélectionné)")
-                for ex_code in sorted(max_by_ex.keys(), key=lambda s: int(s) if s.isdigit() else 9999):
-                    self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
-                                          values=("", f"{max_by_ex[ex_code]:g}"))
-                self.info_total_var.set(f"— / {max_total:g}")
-                return
-
-            self.info_doc_var.set(f"Document : {doc.original_name}")
-
-            ann = self.project.settings.get("annotations", {})
-            anns = ann.get(doc.id, []) if isinstance(ann, dict) else []
-
-            attrib_by_ex: dict[str, float] = {k: 0.0 for k in max_by_ex.keys()}
-            if isinstance(anns, list):
-                for a in anns:
-                    if not isinstance(a, dict):
-                        continue
-                    if a.get("kind") != "score_circle":
-                        continue
-                    code = str(a.get("exercise_code", "")).strip()
-                    if not code:
-                        continue
-                    ex_code = code.split(".", 1)[0]
-                    try:
-                        pts = float(a.get("points", 0.0))
-                    except Exception:
-                        pts = 0.0
-                    attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
-
-            attrib_total = sum(attrib_by_ex.values())
-
-            def sort_key_ex(s: str):
-                try:
-                    return int(s)
-                except Exception:
-                    return 9999
-
-            for ex_code in sorted(max_by_ex.keys(), key=sort_key_ex):
-                attrib = attrib_by_ex.get(ex_code, 0.0)
-                mx = max_by_ex.get(ex_code, 0.0)
-                self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
-                                      values=(f"{attrib:g}", f"{mx:g}"))
-
-            self.info_total_var.set(f"{attrib_total:g} / {max_total:g}")
 
         # ---------------- Launch ----------------
+
+
+    def c_regenerate(self) -> None:
+        if not self._require_doc():
+            return
+        assert self.project is not None
+        doc = self.project.get_current_doc()
+        assert doc is not None
+
+        if "margin" not in doc.variants:
+            self._ensure_project_margins()
+        if "margin" not in doc.variants:
+            messagebox.showwarning("Correction", "Impossible de trouver / créer la variante 'margin'.")
+            return
+
+        base_pdf = self.project.rel_to_abs(doc.variants["margin"])
+        if not base_pdf.exists():
+            messagebox.showwarning("Correction", "PDF marge introuvable.")
+            return
+
+        anns = self._annotations_for_current_doc()
+        out_pdf = self.project.unique_work_path(f"{doc.id}__corrected.pdf")
+        try:
+            apply_annotations(base_pdf, out_pdf, anns)
+        except Exception as e:
+            messagebox.showerror("Correction", f"Erreur génération corrigé.\n\n{e}")
+            return
+
+        doc.variants["corrected"] = self.project.abs_to_rel(out_pdf)
+        self.project.current_variant = "corrected"
+        self.project.save()
+
+        self.viewer.open_pdf(out_pdf)
+
+    def c_delete_last(self) -> None:
+        if not self._require_doc():
+            return
+        anns = self._annotations_for_current_doc()
+        if not anns:
+            return
+        anns.pop()
+        assert self.project is not None
+        self.project.save()
+        self.c_regenerate()
+        self._refresh_marks_list()
+        self._refresh_files_list()
+        self._refresh_info_panel()
+
+    def c_delete_selected(self) -> None:
+        if not self._require_doc():
+            return
+        sel = self.c_marks.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        anns = self._annotations_for_current_doc()
+        score_idxs = [i for i, a in enumerate(anns) if a.get("kind") == "score_circle"]
+        if idx < 0 or idx >= len(score_idxs):
+            return
+        del anns[score_idxs[idx]]
+        assert self.project is not None
+        self.project.save()
+        self.c_regenerate()
+        self._refresh_marks_list()
+        self._refresh_files_list()
+        self._refresh_info_panel()
+
+    # ---------------- Infos : points attribués / max ----------------
+    def _refresh_info_panel(self) -> None:
+        if not hasattr(self, "info_tree"):
+            return
+
+        for iid in self.info_tree.get_children(""):
+            self.info_tree.delete(iid)
+
+        if not self.project:
+            self.info_doc_var.set("Document : —")
+            self.info_total_var.set("— / —")
+            return
+
+        scheme = self._scheme()
+
+        def total_good(node) -> float:
+            if node.children:
+                return sum(total_good(c) for c in node.children)
+            if node.level() in (1, 2):
+                if node.rubric:
+                    return float(node.rubric.good)
+                return 1.0
+            return 0.0
+
+        max_by_ex: dict[str, float] = {}
+        label_by_ex: dict[str, str] = {}
+        for ex in scheme.exercises:
+            ex_code = ex.code
+            max_by_ex[ex_code] = float(total_good(ex))
+            label_by_ex[ex_code] = ex.label or f"Exercice {ex_code}"
+
+        max_total = sum(max_by_ex.values())
+
+        doc = self.project.get_current_doc()
+        if not doc:
+            self.info_doc_var.set("Document : — (aucun sélectionné)")
+            for ex_code in sorted(max_by_ex.keys(), key=lambda s: int(s) if s.isdigit() else 9999):
+                self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
+                                      values=("", f"{max_by_ex[ex_code]:g}"))
+            self.info_total_var.set(f"— / {max_total:g}")
+            return
+
+        self.info_doc_var.set(f"Document : {doc.original_name}")
+
+        ann = self.project.settings.get("annotations", {})
+        anns = ann.get(doc.id, []) if isinstance(ann, dict) else []
+
+        attrib_by_ex: dict[str, float] = {k: 0.0 for k in max_by_ex.keys()}
+        if isinstance(anns, list):
+            for a in anns:
+                if not isinstance(a, dict):
+                    continue
+                if a.get("kind") != "score_circle":
+                    continue
+                code = str(a.get("exercise_code", "")).strip()
+                if not code:
+                    continue
+                ex_code = code.split(".", 1)[0]
+                try:
+                    pts = float(a.get("points", 0.0))
+                except Exception:
+                    pts = 0.0
+                attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
+
+        attrib_total = sum(attrib_by_ex.values())
+
+        def sort_key_ex(s: str):
+            try:
+                return int(s)
+            except Exception:
+                return 9999
+
+        for ex_code in sorted(max_by_ex.keys(), key=sort_key_ex):
+            attrib = attrib_by_ex.get(ex_code, 0.0)
+            mx = max_by_ex.get(ex_code, 0.0)
+            self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
+                                  values=(f"{attrib:g}", f"{mx:g}"))
+
+        self.info_total_var.set(f"{attrib_total:g} / {max_total:g}")
+
 def run_app() -> None:
     root = tk.Tk()
     AppWindow(root)
