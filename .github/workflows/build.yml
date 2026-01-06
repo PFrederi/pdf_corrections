@@ -10,9 +10,7 @@ permissions:
   contents: write
 
 env:
-  # APP_ID = nom de binaire (sans espaces, plus robuste sur Windows/Mac)
   APP_ID: "pdf_corrections"
-  APP_NAME: "PDF Corrections"
   ENTRYPOINT: "app/main.py"
   PYTHON_VERSION: "3.11"
 
@@ -62,34 +60,21 @@ jobs:
           rm -rf build dist *.spec || true
           pyinstaller --noconfirm --clean --windowed --name "${APP_ID}" "${ENTRYPOINT}"
 
-      - name: Package artifact
+      - name: Package artifact (Windows)
+        if: matrix.label == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          python -m pip freeze | Out-File -Encoding utf8 "artifacts/pip-freeze-windows.txt"
+          Compress-Archive -Path "dist\*" -DestinationPath "artifacts\$env:APP_ID-$env:GITHUB_REF_NAME-windows.zip" -Force
+
+      - name: Package artifact (macOS)
+        if: matrix.label == 'macos'
         shell: bash
         run: |
           mkdir -p artifacts
-
-          # Trace des versions exactes utilisées pour ce build (pratique pour debug)
-          python -m pip freeze > "artifacts/pip-freeze-${{ matrix.label }}.txt"
-
-          if [ "${{ matrix.label }}" = "macos" ]; then
-            # Sur macOS, ditto préserve mieux les .app
-            ditto -c -k --sequesterRsrc --keepParent "dist" "artifacts/${APP_ID}-${{ github.ref_name }}-macos.zip"
-          else
-            # Sur Windows, zip via Python (portable, évite les soucis PowerShell + espaces)
-            python - <<'PY'
-import os, zipfile
-from pathlib import Path
-
-ref = os.environ.get("GITHUB_REF_NAME", "build")
-app_id = os.environ["APP_ID"]
-out = Path("artifacts") / f"{app_id}-{ref}-windows.zip"
-
-dist = Path("dist")
-with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in dist.rglob("*"):
-        z.write(p, p.as_posix())
-print("Wrote", out)
-PY
-          fi
+          python -m pip freeze > "artifacts/pip-freeze-macos.txt"
+          ditto -c -k --sequesterRsrc --keepParent "dist" "artifacts/${APP_ID}-${GITHUB_REF_NAME}-macos.zip"
 
       - name: Upload artifact (Actions)
         uses: actions/upload-artifact@v4
@@ -119,5 +104,4 @@ PY
             gh release create "$TAG" --title "$TAG" --notes "Build automatique ($TAG)"
           fi
 
-          find artifacts -type f -name "*.zip" -print0 | \
-            xargs -0 -I {} gh release upload "$TAG" "{}" --clobber
+          find artifacts -type f -name "*.zip" -print0 |             xargs -0 -I {} gh release upload "$TAG" "{}" --clobber
