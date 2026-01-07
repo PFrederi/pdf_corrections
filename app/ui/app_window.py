@@ -90,7 +90,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.3"
+APP_VERSION = "0.0.4"
 
 
 class AppWindow:
@@ -2551,7 +2551,7 @@ class AppWindow:
         self.project.current_variant = "corrected"
         self.project.save()
 
-        self.viewer.open_pdf(out_pdf)
+        self.viewer.open_pdf(out_pdf, preserve_view=True)
 
     def c_delete_last(self) -> None:
         if not self._require_doc():
