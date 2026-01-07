@@ -191,11 +191,16 @@ class AppWindow:
         ttk.Button(frm, text="Importer PDF(s)…", command=self.import_pdfs).pack(anchor="w", pady=(10, 10))
 
         ttk.Label(frm, text="Documents du projet :").pack(anchor="w", pady=(6, 4))
+        list_wrap = ttk.Frame(frm)
+        list_wrap.pack(fill="both", expand=False, pady=(0, 8))
         self.files_list = tk.Listbox(
-            frm, height=18, bg=DARK_BG_2, fg="white",
+            list_wrap, height=18, bg=DARK_BG_2, fg="white",
             highlightthickness=0, selectbackground="#2F81F7"
         )
-        self.files_list.pack(fill="x", pady=(0, 8))
+        files_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=self.files_list.yview)
+        self.files_list.configure(yscrollcommand=files_scroll.set)
+        self.files_list.pack(side="left", fill="both", expand=True)
+        files_scroll.pack(side="right", fill="y")
         self.files_list.bind("<<ListboxSelect>>", self.on_select_file)
 
         ttk.Label(frm, text="Astuce : Visualisation PDF > Correction V0 → clique dans le PDF pour poser les pastilles.").pack(anchor="w", pady=(10, 0))
@@ -581,6 +586,14 @@ class AppWindow:
         self._btn_clear_sel = ttk.Button(bar2, text="Désélectionner", command=self.ann_clear_selection)
         self._btn_clear_sel.pack(side="left")
 
+
+        # Zoom (utile quand on zoome : + / - / reset)
+        zoom_box = ttk.Frame(bar2)
+        zoom_box.pack(side="right")
+        ttk.Button(zoom_box, text="Zoom -", width=8, command=lambda: self._viewer_zoom(-1)).pack(side="left", padx=(0, 4))
+        ttk.Button(zoom_box, text="100%", width=6, command=self._viewer_zoom_reset).pack(side="left", padx=(0, 4))
+        ttk.Button(zoom_box, text="Zoom +", width=8, command=lambda: self._viewer_zoom(+1)).pack(side="left")
+
         ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=(6, 6))
 
         row = ttk.Frame(parent)
@@ -623,6 +636,31 @@ class AppWindow:
         self._update_annot_toolbar_state()
 
 
+
+
+    # ---------------- PDF Viewer helpers ----------------
+    def _viewer_zoom(self, step_or_factor: float) -> None:
+        """Zoom du PDF (step +1/-1 ou facteur 1.1/0.9)."""
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        fn = getattr(v, "zoom", None)
+        if callable(fn):
+            try:
+                fn(step_or_factor)
+            except Exception:
+                pass
+
+    def _viewer_zoom_reset(self) -> None:
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        fn = getattr(v, "zoom_reset", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
 
     def _sync_tool_combo_from_var(self) -> None:
         """Synchronise la combobox d'outils (UI) avec self.ann_tool_var (logique).
