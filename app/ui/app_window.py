@@ -15,6 +15,7 @@ from app.core.project import Project
 from app.services.pdf_margin import add_left_margin
 from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
+from app.services.pdf_recap_to_csv_table_fixed2 import collect_results as recap_collect_results, write_csv as recap_write_csv
 
 def _sanitize_tk_filetypes(filetypes):
     """Nettoie les filetypes pour éviter des crashs Tk sur macOS (NSOpenPanel/NSSavePanel).
@@ -161,16 +162,19 @@ class AppWindow:
         self.tab_view = ttk.Frame(self.nb)
         self.tab_export = ttk.Frame(self.nb)
         self.tab_grading = ttk.Frame(self.nb)
+        self.tab_synth_note = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_project, text="Import / Projet")
         self.nb.add(self.tab_view, text="Visualisation PDF")
         self.nb.add(self.tab_export, text="Export verrouillé")
         self.nb.add(self.tab_grading, text="Notation")
+        self.nb.add(self.tab_synth_note, text="Synthese Note")
 
         self._build_tab_project()
         self._build_tab_view()
         self._build_tab_export()
         self._build_tab_grading()
+        self._build_tab_synthese_note()
 
         self.nb.bind("<<NotebookTabChanged>>", self._update_click_mode)
         # Rafraîchit le mode de clic quand l'outil change
@@ -492,6 +496,195 @@ class AppWindow:
         self.refresh_grading_tree()
 
     # ---------------- Click mode (Correction V0) ----------------
+
+    def _build_tab_synthese_note(self) -> None:
+        """Onglet: extrait le bloc RÉCAPITULATIF des PDF verrouillés et construit un tableau + CSV."""
+        frm = ttk.Frame(self.tab_synth_note)
+        frm.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # Etat
+        self.sn_pdf_paths: list[Path] = []
+        self.sn_sel_info = tk.StringVar(value="Aucun fichier sélectionné.")
+        default_out = str(Path.home() / "notes_recapitulatif.csv")
+        try:
+            if self.project is not None:
+                default_out = str((self.project.root_dir / "exports" / "notes_recapitulatif.csv").resolve())
+        except Exception:
+            pass
+        self.sn_out_var = tk.StringVar(value=default_out)
+
+        # --- 1) Sélection ---
+        sel_box = ttk.LabelFrame(frm, text="1) Sélection des PDF", padding=10)
+        sel_box.pack(fill="x")
+
+        btns = ttk.Frame(sel_box)
+        btns.pack(fill="x")
+
+        def _refresh_sel_label():
+            if not self.sn_pdf_paths:
+                self.sn_sel_info.set("Aucun fichier sélectionné.")
+            else:
+                self.sn_sel_info.set(f"{len(self.sn_pdf_paths)} PDF sélectionné(s).")
+
+        def _refresh_listbox():
+            lb.delete(0, "end")
+            for p in self.sn_pdf_paths:
+                lb.insert("end", str(p))
+            _refresh_sel_label()
+
+        def choose_folder():
+            folder = filedialog.askdirectory(title="Choisir un dossier contenant des PDF")
+            if not folder:
+                return
+            folder_path = Path(folder)
+            self.sn_pdf_paths = sorted(folder_path.glob("*.pdf"))
+            _refresh_listbox()
+
+        def choose_files():
+            files = filedialog.askopenfilenames(
+                title="Choisir des fichiers PDF",
+                filetypes=_sanitize_tk_filetypes([("PDF", "*.pdf")]),
+            )
+            if not files:
+                return
+            self.sn_pdf_paths = [Path(p) for p in files]
+            _refresh_listbox()
+
+        def remove_selected():
+            sel = list(lb.curselection())
+            if not sel:
+                return
+            keep = []
+            for i, p in enumerate(self.sn_pdf_paths):
+                if i not in sel:
+                    keep.append(p)
+            self.sn_pdf_paths = keep
+            _refresh_listbox()
+
+        def clear_list():
+            self.sn_pdf_paths = []
+            _refresh_listbox()
+
+        ttk.Button(btns, text="Choisir un dossier…", command=choose_folder).pack(side="left")
+        ttk.Button(btns, text="Choisir des PDF…", command=choose_files).pack(side="left", padx=8)
+        ttk.Button(btns, text="Retirer la sélection", command=remove_selected).pack(side="left", padx=8)
+        ttk.Button(btns, text="Vider", command=clear_list).pack(side="left")
+
+        ttk.Label(sel_box, textvariable=self.sn_sel_info).pack(anchor="w", pady=(8, 0))
+
+        # Listbox + scrollbar
+        list_row = ttk.Frame(sel_box)
+        list_row.pack(fill="both", expand=False, pady=(8, 0))
+        lb = tk.Listbox(list_row, height=6, selectmode="extended")
+        lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_row, orient="vertical", command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.configure(yscrollcommand=sb.set)
+
+        # --- 2) Sortie CSV ---
+        out_box = ttk.LabelFrame(frm, text="2) Fichier de sortie CSV", padding=10)
+        out_box.pack(fill="x", pady=10)
+
+        out_row = ttk.Frame(out_box)
+        out_row.pack(fill="x")
+        out_entry = ttk.Entry(out_row, textvariable=self.sn_out_var)
+        out_entry.pack(side="left", fill="x", expand=True)
+
+        def choose_output():
+            p = filedialog.asksaveasfilename(
+                title="Enregistrer le CSV",
+                defaultextension=".csv",
+                filetypes=_sanitize_tk_filetypes([("CSV", "*.csv")]),
+                initialfile=Path(self.sn_out_var.get()).name if self.sn_out_var.get() else "notes_recapitulatif.csv",
+            )
+            if p:
+                self.sn_out_var.set(p)
+
+        def use_project_exports():
+            if self.project is None:
+                messagebox.showwarning("Projet", "Aucun projet ouvert.")
+                return
+            exports_dir = (self.project.root_dir / "exports").resolve()
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            self.sn_out_var.set(str((exports_dir / "notes_recapitulatif.csv").resolve()))
+
+        ttk.Button(out_row, text="Choisir…", command=choose_output).pack(side="left", padx=8)
+        ttk.Button(out_row, text="Utiliser exports du projet", command=use_project_exports).pack(side="left")
+
+        # --- 3) Actions ---
+        act_box = ttk.LabelFrame(frm, text="3) Génération", padding=10)
+        act_box.pack(fill="x")
+
+        ttk.Button(act_box, text="Générer (CSV + tableau)", command=lambda: generate()).pack(anchor="w")
+
+        # --- 4) Tableau (Treeview) ---
+        table_box = ttk.LabelFrame(frm, text="Résultats", padding=10)
+        table_box.pack(fill="both", expand=True, pady=(10, 0))
+
+        table_container = ttk.Frame(table_box)
+        table_container.pack(fill="both", expand=True)
+
+        self.sn_tree = ttk.Treeview(table_container, columns=("NOM PRENOM", "Total"), show="headings")
+        vsb = ttk.Scrollbar(table_container, orient="vertical", command=self.sn_tree.yview)
+        hsb = ttk.Scrollbar(table_container, orient="horizontal", command=self.sn_tree.xview)
+        self.sn_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.sn_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        table_container.rowconfigure(0, weight=1)
+        table_container.columnconfigure(0, weight=1)
+
+        def _setup_columns(columns: list[str]):
+            self.sn_tree["columns"] = columns
+            for col in columns:
+                self.sn_tree.heading(col, text=col)
+                w = 260 if col == "NOM PRENOM" else 90
+                self.sn_tree.column(col, width=w, minwidth=70, stretch=True, anchor="center")
+
+        def _fill_rows(results, columns):
+            for iid in self.sn_tree.get_children(""):
+                self.sn_tree.delete(iid)
+            for r in results:
+                row = {"NOM PRENOM": r.name}
+                row.update(r.scores)
+                values = [row.get(c, "") for c in columns]
+                self.sn_tree.insert("", "end", values=values)
+
+        def copy_all():
+            cols = list(self.sn_tree["columns"])
+            lines = ["\t".join(cols)]
+            for iid in self.sn_tree.get_children(""):
+                vals = self.sn_tree.item(iid, "values")
+                lines.append("\t".join(str(v) for v in vals))
+            txt_clip = "\n".join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt_clip)
+            self.root.update()
+
+        btn_row = ttk.Frame(table_box)
+        btn_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="Copier le tableau (TSV)", command=copy_all).pack(side="left")
+        ttk.Label(btn_row, text="(Coller directement dans Excel / Sheets)").pack(side="left", padx=10)
+
+        def generate():
+            if not self.sn_pdf_paths:
+                messagebox.showwarning("Synthèse", "Veuillez sélectionner un dossier ou des PDF.")
+                return
+            out_path = Path(self.sn_out_var.get()).expanduser()
+            try:
+                results, columns = recap_collect_results(self.sn_pdf_paths)
+                recap_write_csv(out_path, results, columns)
+                _setup_columns(columns)
+                _fill_rows(results, columns)
+                messagebox.showinfo("Synthèse", f"CSV généré :\n{out_path}")
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e))
+
+        # Init
+        _refresh_listbox()
+        _setup_columns(["NOM PRENOM", "Total"])
+
     def _update_click_mode(self, _evt=None) -> None:
         main = self.nb.tab(self.nb.select(), "text")
         sub = ""

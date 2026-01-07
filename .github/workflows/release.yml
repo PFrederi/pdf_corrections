@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4  
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -54,7 +54,6 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           pyinstaller --noconfirm --clean --windowed --name "PDF Corrections" --icon assets/icon/app_icon.icns app/main.py
-
 
       # Package Windows -> zip
       - name: Package (Windows)

@@ -103,6 +103,7 @@ class PDFViewer(ttk.Frame):
         self.canvas.unbind("<B1-Motion>")
         self.canvas.unbind("<ButtonRelease-1>")
         self.canvas.unbind("<Button-3>")
+        self.canvas.unbind("<Button-2>")
         self.canvas.unbind("<Control-Button-1>")  # mac trackpad parfois
 
         if click_cb is not None:
@@ -118,6 +119,8 @@ class PDFViewer(ttk.Frame):
 
         if context_cb is not None:
             self.canvas.bind("<Button-3>", self._on_context_menu)
+            # macOS: clic droit trackpad peut arriver en Button-2
+            self.canvas.bind("<Button-2>", self._on_context_menu)
 
     # ---------------- Zoom API (public) ----------------
     def get_zoom(self) -> float:
@@ -348,4 +351,15 @@ class PDFViewer(ttk.Frame):
             return
         cx, cy = self._event_to_canvas_xy(e)
         p, x_pt, y_pt = self._canvas_to_pdf(cx, cy)
-        self._context_cb(p, x_pt, y_pt)
+        # Compat : certaines implémentations attendent aussi les coordonnées écran (x_root, y_root)
+        try:
+            self._context_cb(p, x_pt, y_pt, int(getattr(e, "x_root", 0)), int(getattr(e, "y_root", 0)))
+        except TypeError:
+            try:
+                self._context_cb(p, x_pt, y_pt)
+            except TypeError:
+                # ultime fallback : passer l'événement brut
+                try:
+                    self._context_cb(e)
+                except Exception:
+                    pass
