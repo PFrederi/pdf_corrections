@@ -4,6 +4,7 @@ import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path
+import fitz  # PyMuPDF
 import uuid
 import math
 import copy
@@ -23,7 +24,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.2"
+APP_VERSION = "0.0.3"
 
 
 class AppWindow:
@@ -40,6 +41,10 @@ class AppWindow:
         self._drag_active: bool = False
         self._drag_target_idx: int | None = None
 
+        # Style du libellé des pastilles (Correction V0) : "blue" (bleu) ou "red_bold" (rouge gras)
+        self.c_label_style_var = tk.StringVar(value="blue")
+        self.c_label_style_var.trace_add("write", lambda *_: self._on_pastille_label_style_changed())
+
         # Outils d'annotation classiques (Visualisation PDF)
         self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow
         self.ann_color_var = tk.StringVar(value="bleu")  # couleur trait / flèche
@@ -52,6 +57,9 @@ class AppWindow:
         # Sélection d'annotations (outil 'Sélection')
         self._selected_ann_ids: set[str] = set()
         self._sel_info_var = tk.StringVar(value="Sélection : 0")
+        self.sel_mode_var = tk.BooleanVar(value=True)
+        self.sel_mode_var.trace_add("write", lambda *_: self._update_click_mode())
+
 
         # Etat runtime (drag)
         self._draw_kind: str | None = None
@@ -65,6 +73,7 @@ class AppWindow:
         self._move_ann_id: str | None = None
         self._move_anchor: tuple[float, float] | None = None
         self._move_snapshot: dict | None = None
+        self._move_has_moved: bool = False
 
 
         # --- Barre haute ---
@@ -102,6 +111,11 @@ class AppWindow:
         # Rafraîchit le mode de clic quand l'outil change
         self.ann_tool_var.trace_add("write", lambda *_: (self._sync_tool_combo_from_var(), self._update_annot_toolbar_state(), self._update_click_mode()))
         self.ann_color_var.trace_add("write", lambda *_: self._update_click_mode())
+
+        # Molette souris / trackpad : route le scroll vers la zone sous le curseur (PDF à droite ou panneau Correction V0 à gauche)
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_global_mousewheel_linux, add="+")
+        self.root.bind_all("<Button-5>", self._on_global_mousewheel_linux, add="+")
 
     # ---------------- UI : Import/Projet ----------------
     def _build_tab_project(self) -> None:
@@ -155,12 +169,42 @@ class AppWindow:
         self._click_hint = ttk.Label(self.view_left, text="Mode clic : OFF")
         self._click_hint.pack(anchor="w", padx=10, pady=(6, 6))
     def _build_view_correction_panel(self) -> None:
-        frm = ttk.Frame(self.sub_correction)
+        # Zone scrollable : indispensable quand la fenêtre est petite (sinon les boutons du bas disparaissent)
+        outer = ttk.Frame(self.sub_correction)
+        outer.pack(fill="both", expand=True)
+
+        self._corr_scroll_canvas = tk.Canvas(outer, bg=DARK_BG, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(outer, orient="vertical", command=self._corr_scroll_canvas.yview)
+        self._corr_scroll_canvas.configure(yscrollcommand=v_scroll.set)
+
+        v_scroll.pack(side="right", fill="y")
+        self._corr_scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(self._corr_scroll_canvas)
+        inner_id = self._corr_scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_evt=None):
+            try:
+                self._corr_scroll_canvas.configure(scrollregion=self._corr_scroll_canvas.bbox("all"))
+            except Exception:
+                pass
+
+        def _on_canvas_configure(evt):
+            # garde la largeur du contenu alignée sur le canvas (sinon barre horizontale implicite)
+            try:
+                self._corr_scroll_canvas.itemconfigure(inner_id, width=evt.width)
+            except Exception:
+                pass
+
+        inner.bind("<Configure>", _on_inner_configure)
+        self._corr_scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        frm = ttk.Frame(inner)
         frm.pack(fill="both", expand=True, padx=10, pady=10)
 
         ttk.Label(frm, text="V0 — Correction par barème").pack(anchor="w")
         ttk.Label(frm, text="Choisis un item + résultat, puis clique où tu veux sur le PDF.").pack(anchor="w", pady=(4, 6))
-        ttk.Label(frm, text="(Pastille + libellé bleu à droite)").pack(anchor="w", pady=(0, 10))
+        ttk.Label(frm, text="(Pastille + libellé à droite)").pack(anchor="w", pady=(0, 10))
 
         # Résumé points (document courant)
         self.c_total_var = tk.StringVar(value="Total attribué : — / —")
@@ -168,6 +212,14 @@ class AppWindow:
 
         self.c_move_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 10))
+        ttk.Label(frm, text="Style du libellé :").pack(anchor="w")
+        style_row = ttk.Frame(frm)
+        style_row.pack(anchor="w", pady=(2, 4))
+        ttk.Radiobutton(style_row, text="Bleu", variable=self.c_label_style_var, value="blue").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(style_row, text="Rouge gras", variable=self.c_label_style_var, value="red_bold").pack(side="left")
+
+        ttk.Button(frm, text="Appliquer ce style aux pastilles existantes", command=self.c_apply_label_style_to_all).pack(anchor="w", pady=(0, 10))
+
 
         ttk.Label(frm, text="Item (feuille) :").pack(anchor="w")
         self.c_item_var = tk.StringVar(value="")
@@ -198,8 +250,82 @@ class AppWindow:
         ttk.Button(frm, text="Régénérer PDF corrigé", command=self.c_regenerate).pack(anchor="w")
         ttk.Button(frm, text="Afficher PDF corrigé", command=self.open_current_corrected).pack(anchor="w", pady=(6, 0))
 
+        ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(10, 8))
+
+        # Note finale (récapitulatif)
+        ttk.Label(frm, text="Note finale (récapitulatif) :").pack(anchor="w")
+        self.c_final_target_var = tk.StringVar(value="first")
+        target_row = ttk.Frame(frm)
+        target_row.pack(anchor="w", pady=(2, 6))
+        ttk.Radiobutton(target_row, text="Page 1", variable=self.c_final_target_var, value="first").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(target_row, text="Page courante (dernier clic)", variable=self.c_final_target_var, value="current").pack(side="left")
+
+        ttk.Button(frm, text="Insérer la note finale", command=self.c_insert_final_note).pack(anchor="w")
+        ttk.Button(frm, text="Supprimer la note finale", command=self.c_delete_final_note).pack(anchor="w", pady=(6, 0))
+
         self._refresh_correction_ui()
 
+
+
+    # ---------------- Pastilles : style du libellé ----------------
+    def _get_pastille_label_style(self) -> str:
+        """Renvoie le style choisi pour le libellé des pastilles."""
+        try:
+            v = (self.c_label_style_var.get() or "").strip()
+        except Exception:
+            v = ""
+        if v in ("blue", "red_bold"):
+            return v
+        if self.project:
+            pv = str(self.project.settings.get("pastille_label_style", "blue") or "blue").strip()
+            if pv in ("blue", "red_bold"):
+                return pv
+        return "blue"
+
+    def _on_pastille_label_style_changed(self) -> None:
+        """Persiste la préférence dans le projet (si ouvert)."""
+        if not self.project:
+            return
+        style = self._get_pastille_label_style()
+        self.project.settings["pastille_label_style"] = style
+        try:
+            self.project.save()
+        except Exception:
+            pass
+
+    def c_apply_label_style_to_all(self) -> None:
+        """Applique le style du libellé à toutes les pastilles du document courant."""
+        if not self._require_doc():
+            return
+        assert self.project is not None
+
+        style = self._get_pastille_label_style()
+        anns = self._annotations_for_current_doc()
+        changed = 0
+
+        for a in anns:
+            if not isinstance(a, dict) or a.get("kind") != "score_circle":
+                continue
+            st = a.get("style") or {}
+            if not isinstance(st, dict):
+                st = {}
+            if st.get("label_style") != style:
+                st["label_style"] = style
+                a["style"] = st
+                changed += 1
+
+        if not changed:
+            messagebox.showinfo("Correction", "Aucune pastille à mettre à jour.")
+            return
+
+        self.project.save()
+        self.c_regenerate()
+        self._refresh_marks_list()
+        self._refresh_files_list()
+        self._refresh_info_panel()
+        self._refresh_correction_totals()
+
+        messagebox.showinfo("Correction", f"{changed} pastille(s) mise(s) à jour.")
 
     def _build_view_info_panel(self) -> None:
         frm = ttk.Frame(self.sub_info)
@@ -305,7 +431,13 @@ class AppWindow:
             sub = ""
 
         tool = self.ann_tool_var.get() if hasattr(self, "ann_tool_var") else "none"
-        enabled = (main == "Visualisation PDF") and ((sub == "Correction V0") or (tool != "none"))
+        sel_on = False
+        try:
+            sel_on = bool(self.sel_mode_var.get())
+        except Exception:
+            sel_on = False
+
+        enabled = (main == "Visualisation PDF") and ((sub == "Correction V0") or (tool != "none") or sel_on)
 
         self.viewer.set_interaction_callbacks(
             click_cb=self._on_pdf_click if enabled else None,
@@ -317,7 +449,22 @@ class AppWindow:
         if hasattr(self, "_click_hint"):
             label = "OFF"
             if enabled:
-                label = f"ON • outil: {tool}" if tool != "none" else "ON • pastilles"
+                if sub == "Correction V0":
+                    label = "ON • pastilles"
+                else:
+                    sel = False
+                    try:
+                        sel = bool(self.sel_mode_var.get())
+                    except Exception:
+                        sel = False
+                    if tool != "none" and sel:
+                        label = f"ON • outil: {tool} + sélection"
+                    elif tool != "none":
+                        label = f"ON • outil: {tool}"
+                    elif sel:
+                        label = "ON • sélection/déplacement"
+                    else:
+                        label = "ON"
             self._click_hint.configure(text=f"Mode clic : {label}")
 
 
@@ -329,6 +476,15 @@ class AppWindow:
 
         ttk.Label(bar, text="Outils :").pack(side="left")
 
+        # Mode sélection (permet de sélectionner + déplacer par glisser-déposer)
+        self._sel_toggle = ttk.Checkbutton(
+            bar,
+            text="Sélection",
+            variable=self.sel_mode_var,
+            command=self._on_sel_toggle,
+        )
+        self._sel_toggle.pack(side="left", padx=(8, 8))
+
         # Combobox (plus robuste que des boutons côte-à-côte : évite que des outils soient cachés
         # quand la fenêtre est étroite ou en HiDPI)
         self._tool_map = [
@@ -336,8 +492,6 @@ class AppWindow:
             ("Main levée", "ink"),
             ("Texte", "textbox"),
             ("Flèche", "arrow"),
-            ("Sélection", "select"),
-            ("Déplacer", "move"),
         ]
         self._tool_label_var = tk.StringVar(value="Aucun")
         self._tool_combo = ttk.Combobox(
@@ -352,12 +506,14 @@ class AppWindow:
         self._sync_tool_combo_from_var()
 
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=12)
+        # Ligne 2 : sélection / suppression (évite que des boutons soient cachés en HiDPI)
+        bar2 = ttk.Frame(parent)
+        bar2.pack(fill="x", padx=10, pady=(6, 0))
 
-        ttk.Label(bar, textvariable=self._sel_info_var).pack(side="left", padx=(0, 8))
-        self._btn_del_sel = ttk.Button(bar, text="Supprimer sélection", command=self.ann_delete_selected)
+        ttk.Label(bar2, textvariable=self._sel_info_var).pack(side="left", padx=(0, 8))
+        self._btn_del_sel = ttk.Button(bar2, text="Supprimer sélection", command=self.ann_delete_selected)
         self._btn_del_sel.pack(side="left", padx=(0, 6))
-        self._btn_clear_sel = ttk.Button(bar, text="Désélectionner", command=self.ann_clear_selection)
+        self._btn_clear_sel = ttk.Button(bar2, text="Désélectionner", command=self.ann_clear_selection)
         self._btn_clear_sel.pack(side="left")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=(6, 6))
@@ -465,6 +621,39 @@ class AppWindow:
         except Exception:
             pass
 
+    def _on_sel_toggle(self) -> None:
+        """Active/désactive le mode sélection (sélection + déplacement par glisser-déposer)."""
+        enabled = False
+        try:
+            enabled = bool(self.sel_mode_var.get())
+        except Exception:
+            enabled = False
+
+        if not enabled:
+            # On coupe proprement : stop move + clear sélection
+            try:
+                self._reset_draw_state()
+            except Exception:
+                pass
+            try:
+                self._selected_ann_ids.clear()
+            except Exception:
+                pass
+            try:
+                self._update_selection_info()
+            except Exception:
+                pass
+
+        # refresh callbacks + hint
+        try:
+            self._update_click_mode()
+        except Exception:
+            pass
+        try:
+            self._update_annot_toolbar_state()
+        except Exception:
+            pass
+
     def _update_annot_toolbar_state(self) -> None:
         """Active/désactive certains contrôles selon l'outil sélectionné.
 
@@ -501,12 +690,6 @@ class AppWindow:
             set_state(ann_text, True)
             set_state(txt_color, True)
             set_state(txt_size, True)
-        elif tool in ("select", "move"):
-            set_state(ann_color, False)
-            set_state(ann_width, False)
-            set_state(ann_text, False)
-            set_state(txt_color, False)
-            set_state(txt_size, False)
         else:
             set_state(ann_color, False)
             set_state(ann_width, False)
@@ -535,6 +718,7 @@ class AppWindow:
         self._move_ann_id = None
         self._move_anchor = None
         self._move_snapshot = None
+        self._move_has_moved = False
 
     # ---------------- Sélection / suppression d'annotations ----------------
     def _update_selection_info(self) -> None:
@@ -707,6 +891,41 @@ class AppWindow:
 
 
     def _on_pdf_click(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        self._last_interaction_page = int(page_index)
+        # Priorité : si le mode sélection est activé et qu'on clique sur une annotation,
+        # on sélectionne puis on prépare un déplacement (glisser-déposer).
+        sel_on = False
+        try:
+            sel_on = bool(self.sel_mode_var.get())
+        except Exception:
+            sel_on = False
+
+        if sel_on:
+            if not self._require_doc():
+                return
+            ann = self._find_nearest_annotation(page_index, x_pt, y_pt)
+            if ann:
+                ann_id = str(ann.get("id", "")) if isinstance(ann, dict) else ""
+                self._selected_ann_ids = {ann_id} if ann_id else set()
+                self._update_selection_info()
+
+                # Prépare déplacement
+                self._draw_kind = "move"
+                self._draw_page = int(page_index)
+                self._move_active = True
+                self._move_ann_id = ann_id if ann_id else None
+                self._move_anchor = (float(x_pt), float(y_pt))
+                self._move_snapshot = copy.deepcopy(ann) if isinstance(ann, dict) else None
+                self._move_has_moved = False
+                if hasattr(self, "_click_hint"):
+                    self._click_hint.configure(text="Mode clic : ON • sélection/déplacement (glisse pour déplacer)")
+                return
+            else:
+                # clic dans le vide : on désélectionne, mais on laisse les outils d'annotation fonctionner
+                if self._selected_ann_ids:
+                    self._selected_ann_ids.clear()
+                    self._update_selection_info()
+
         # 1) outils d'annotation ?
         tool = self.ann_tool_var.get()
         if tool != "none":
@@ -714,28 +933,6 @@ class AppWindow:
                 return
             self._draw_kind = tool
             self._draw_page = int(page_index)
-            if tool == "select":
-                self._select_annotation_at(page_index, x_pt, y_pt)
-                return
-
-            if tool == "move":
-                ann = self._find_nearest_annotation(page_index, x_pt, y_pt)
-                if not ann:
-                    if hasattr(self, "_click_hint"):
-                        self._click_hint.configure(text="Mode clic : ON • déplacer : rien à proximité")
-                    self._reset_draw_state()
-                    return
-                self._move_active = True
-                self._move_ann_id = str(ann.get("id", ""))
-                self._move_anchor = (float(x_pt), float(y_pt))
-                self._move_snapshot = copy.deepcopy(ann)
-                # Met en évidence la sélection
-                self._selected_ann_ids = {self._move_ann_id} if self._move_ann_id else set()
-                self._update_selection_info()
-                if hasattr(self, "_click_hint"):
-                    self._click_hint.configure(text="Mode clic : ON • déplacer : glisse puis relâche")
-                return
-
 
             if tool == "ink":
                 self._draw_points = [(float(x_pt), float(y_pt))]
@@ -757,52 +954,74 @@ class AppWindow:
             self._on_pdf_click_for_correction(page_index, x_pt, y_pt)
 
     def _on_pdf_drag(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        # 1) déplacement d'une annotation sélectionnée (si mode sélection actif et clic sur ann)
+        if self._draw_kind == "move":
+            if self._draw_page is None or int(page_index) != int(self._draw_page):
+                return
+            if not (self._move_active and self._move_ann_id and self._move_anchor and self._move_snapshot):
+                return
+
+            dx = float(x_pt) - float(self._move_anchor[0])
+            dy = float(y_pt) - float(self._move_anchor[1])
+            if abs(dx) > 0.2 or abs(dy) > 0.2:
+                self._move_has_moved = True
+
+            anns = self._annotations_for_current_doc()
+            target = None
+            for a in anns:
+                if isinstance(a, dict) and str(a.get("id", "")) == self._move_ann_id:
+                    target = a
+                    break
+            if not target:
+                return
+
+            orig = self._move_snapshot
+            kind = orig.get("kind") if isinstance(orig, dict) else None
+
+            if kind == "score_circle":
+                cx = float(orig.get("x_pt", 0.0)) + dx
+                cy = float(orig.get("y_pt", 0.0)) + dy
+                target["x_pt"] = cx
+                target["y_pt"] = cy
+                return
+
+            if kind == "textbox":
+                rect = orig.get("rect")
+                if isinstance(rect, (list, tuple)) and len(rect) == 4:
+                    target["rect"] = [
+                        float(rect[0]) + dx,
+                        float(rect[1]) + dy,
+                        float(rect[2]) + dx,
+                        float(rect[3]) + dy,
+                    ]
+                return
+
+            if kind == "arrow":
+                s = orig.get("start")
+                e = orig.get("end")
+                if isinstance(s, (list, tuple)) and len(s) == 2 and isinstance(e, (list, tuple)) and len(e) == 2:
+                    target["start"] = [float(s[0]) + dx, float(s[1]) + dy]
+                    target["end"] = [float(e[0]) + dx, float(e[1]) + dy]
+                return
+
+            if kind == "ink":
+                pts = orig.get("points")
+                if isinstance(pts, list) and pts:
+                    new_pts = []
+                    for p in pts:
+                        if isinstance(p, (list, tuple)) and len(p) == 2:
+                            new_pts.append([float(p[0]) + dx, float(p[1]) + dy])
+                    if new_pts:
+                        target["points"] = new_pts
+                return
+
+            return
+
+        # 2) dessin (outil combo)
         tool = self.ann_tool_var.get()
         if tool != "none":
             if self._draw_page is None or int(page_index) != int(self._draw_page):
                 return
-
-            if self._draw_kind == "move":
-                if not (self._move_active and self._move_ann_id and self._move_anchor and self._move_snapshot):
-                    return
-                dx = float(x_pt) - float(self._move_anchor[0])
-                dy = float(y_pt) - float(self._move_anchor[1])
-                anns = self._annotations_for_current_doc()
-                target = None
-                for a in anns:
-                    if isinstance(a, dict) and str(a.get("id", "")) == self._move_ann_id:
-                        target = a
-                        break
-                if not isinstance(target, dict):
-                    return
-                orig = self._move_snapshot if isinstance(self._move_snapshot, dict) else {}
-                kind = str(target.get("kind", ""))
-                if kind == "score_circle":
-                    target["x_pt"] = float(orig.get("x_pt", 0.0)) + dx
-                    target["y_pt"] = float(orig.get("y_pt", 0.0)) + dy
-                    return
-                if kind == "textbox":
-                    rect = orig.get("rect")
-                    if isinstance(rect, (list, tuple)) and len(rect) == 4:
-                        target["rect"] = [float(rect[0]) + dx, float(rect[1]) + dy, float(rect[2]) + dx, float(rect[3]) + dy]
-                    return
-                if kind == "arrow":
-                    s = orig.get("start")
-                    e = orig.get("end")
-                    if isinstance(s, (list, tuple)) and len(s) == 2 and isinstance(e, (list, tuple)) and len(e) == 2:
-                        target["start"] = [float(s[0]) + dx, float(s[1]) + dy]
-                        target["end"] = [float(e[0]) + dx, float(e[1]) + dy]
-                    return
-                if kind == "ink":
-                    pts = orig.get("points")
-                    if isinstance(pts, list) and pts:
-                        new_pts = []
-                        for p in pts:
-                            if isinstance(p, (list, tuple)) and len(p) == 2:
-                                new_pts.append([float(p[0]) + dx, float(p[1]) + dy])
-                        if new_pts:
-                            target["points"] = new_pts
-                    return
 
             if self._draw_kind == "ink":
                 if not self._draw_points:
@@ -819,7 +1038,7 @@ class AppWindow:
 
             return
 
-        # pastilles: déplacement éventuel
+        # 3) pastilles: déplacement éventuel
         try:
             sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
         except Exception:
@@ -828,6 +1047,22 @@ class AppWindow:
             self._on_pdf_drag_for_correction(page_index, x_pt, y_pt)
 
     def _on_pdf_release(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        # Fin d'un déplacement (mode sélection)
+        if self._draw_kind == "move":
+            moved = bool(getattr(self, "_move_has_moved", False))
+            if moved and self._require_doc():
+                try:
+                    # persiste et régénère pour voir le résultat dans la vue PDF
+                    self.project.save()
+                except Exception:
+                    pass
+                try:
+                    self.c_regenerate()
+                except Exception:
+                    pass
+            self._reset_draw_state()
+            return
+
         tool = self.ann_tool_var.get()
         if tool != "none":
             if not self._require_doc():
@@ -975,6 +1210,7 @@ class AppWindow:
         if not doc:
             return []
         ann = self.project.settings.setdefault("annotations", {})
+        self.project.settings.setdefault("pastille_label_style", "blue")
         if not isinstance(ann, dict):
             ann = {}
             self.project.settings["annotations"] = ann
@@ -1080,6 +1316,11 @@ class AppWindow:
 
         self.project.settings["grading_scheme"] = ensure_scheme_dict(self.project.settings.get("grading_scheme"))
         self.project.settings.setdefault("annotations", {})
+        self.project.settings.setdefault("pastille_label_style", "blue")
+        try:
+            self.c_label_style_var.set(str(self.project.settings.get("pastille_label_style", "blue")))
+        except Exception:
+            pass
         self.project.save()
 
         self.project_name_var.set(self.project.name)
@@ -1106,6 +1347,11 @@ class AppWindow:
 
         self.project.settings["grading_scheme"] = ensure_scheme_dict(self.project.settings.get("grading_scheme"))
         self.project.settings.setdefault("annotations", {})
+        self.project.settings.setdefault("pastille_label_style", "blue")
+        try:
+            self.c_label_style_var.set(str(self.project.settings.get("pastille_label_style", "blue")))
+        except Exception:
+            pass
         self.project.save()
 
         self._ensure_project_margins()
@@ -1128,12 +1374,94 @@ class AppWindow:
         self.project.name = self.project_name_var.get().strip() or self.project.name
         self.project.settings["grading_scheme"] = ensure_scheme_dict(self.project.settings.get("grading_scheme"))
         self.project.settings.setdefault("annotations", {})
+        self.project.settings.setdefault("pastille_label_style", "blue")
         try:
             self.project.save()
         except Exception as e:
             messagebox.showerror("Projet", f"Erreur d'enregistrement.\n\n{e}")
             return
         messagebox.showinfo("Projet", f"Projet enregistré :\n{self.project.project_file}")
+
+    # ---------------- Scrolling (molette) ----------------
+    def _is_descendant(self, widget: tk.Widget, ancestor: tk.Widget) -> bool:
+        """Retourne True si widget est (ou est enfant de) ancestor."""
+        try:
+            w = widget
+            while True:
+                if w == ancestor:
+                    return True
+                parent_name = w.winfo_parent()
+                if not parent_name:
+                    break
+                w = w.nametowidget(parent_name)
+        except Exception:
+            pass
+        return False
+
+    def _on_global_mousewheel(self, event) -> str | None:
+        """Route la molette vers la zone sous le curseur (panneau correction ou PDF)."""
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            w = None
+        if not w:
+            return None
+
+        # delta: >0 = wheel up => scroll up (négatif pour yview_scroll)
+        step = -1 if getattr(event, "delta", 0) > 0 else 1
+        # Sur certains Mac, delta est très petit : on garde un pas fixe.
+        units = 2
+
+        # Priorité: panneau Correction V0 (gauche)
+        try:
+            c = getattr(self, "_corr_scroll_canvas", None)
+            if c is not None and self._is_descendant(w, c):
+                c.yview_scroll(step * units, "units")
+                return "break"
+        except Exception:
+            pass
+
+        # PDF viewer (droite)
+        try:
+            vc = getattr(getattr(self, "viewer", None), "canvas", None)
+            if vc is not None and self._is_descendant(w, vc):
+                vc.yview_scroll(step * units, "units")
+                return "break"
+        except Exception:
+            pass
+
+        return None
+
+    def _on_global_mousewheel_linux(self, event) -> str | None:
+        """Linux: Button-4 / Button-5."""
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            w = None
+        if not w:
+            return None
+
+        # Button-4 = up, Button-5 = down
+        step = -1 if getattr(event, "num", 0) == 4 else 1
+        units = 2
+
+        try:
+            c = getattr(self, "_corr_scroll_canvas", None)
+            if c is not None and self._is_descendant(w, c):
+                c.yview_scroll(step * units, "units")
+                return "break"
+        except Exception:
+            pass
+
+        try:
+            vc = getattr(getattr(self, "viewer", None), "canvas", None)
+            if vc is not None and self._is_descendant(w, vc):
+                vc.yview_scroll(step * units, "units")
+                return "break"
+        except Exception:
+            pass
+
+        return None
 
     # ---------------- Import ----------------
     def import_pdfs(self) -> None:
@@ -1707,6 +2035,7 @@ class AppWindow:
                 "fill": RESULT_COLORS.get(result, RESULT_COLORS["good"]),
                 "label_fontsize": 11.0,
                 "label_dx_pt": 15.0,
+                "label_style": self._get_pastille_label_style(),
             },
             "payload": {}
         }
@@ -1790,6 +2119,7 @@ class AppWindow:
                 "fill": RESULT_COLORS.get(result, RESULT_COLORS["good"]),
                 "label_fontsize": 11.0,
                 "label_dx_pt": 15.0,
+                "label_style": self._get_pastille_label_style(),
             },
             "payload": {}
         }
@@ -1961,6 +2291,206 @@ class AppWindow:
         self._refresh_info_panel()
 
     # ---------------- Infos : points attribués / max ----------------
+
+    # ---------------- Note finale (récapitulatif) ----------------
+
+    def _remove_final_note_annotations(self, anns: list[dict]) -> int:
+        """Supprime les annotations de type 'note finale' (tag final_note). Retourne le nombre supprimé."""
+        removed = 0
+        kept: list[dict] = []
+        for a in anns:
+            try:
+                if isinstance(a, dict) and a.get("kind") == "textbox":
+                    payload = a.get("payload") or {}
+                    if isinstance(payload, dict) and payload.get("tag") == "final_note":
+                        removed += 1
+                        continue
+            except Exception:
+                pass
+            kept.append(a)
+        anns[:] = kept
+        return removed
+
+    def _build_final_note_text(self) -> str:
+        """Construit le texte du récapitulatif (points par exercice + total + note /20)."""
+        if not self.project or not self.project.get_current_doc():
+            return ""
+
+        scheme = self._scheme()
+
+        def total_good(node) -> float:
+            if getattr(node, "children", None):
+                return float(sum(total_good(c) for c in node.children))
+            try:
+                lvl = int(node.level())
+            except Exception:
+                lvl = 0
+            if lvl in (1, 2):
+                rub = getattr(node, "rubric", None)
+                if rub is not None:
+                    try:
+                        return float(rub.good)
+                    except Exception:
+                        return 1.0
+                return 1.0
+            return 0.0
+
+        max_by_ex: dict[str, float] = {}
+        for ex in scheme.exercises:
+            try:
+                ex_code = str(ex.code)
+            except Exception:
+                continue
+            max_by_ex[ex_code] = float(total_good(ex))
+
+        # Attribué depuis les pastilles
+        attrib_by_ex: dict[str, float] = {k: 0.0 for k in max_by_ex.keys()}
+        anns = self._annotations_for_current_doc()
+        for a in anns:
+            if not isinstance(a, dict) or a.get("kind") != "score_circle":
+                continue
+            code = str(a.get("exercise_code", "")).strip()
+            if not code:
+                continue
+            ex_code = code.split(".", 1)[0]
+            try:
+                pts = float(a.get("points", 0.0))
+            except Exception:
+                pts = 0.0
+            attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
+
+        def sort_key_ex(s: str):
+            try:
+                return (0, int(s))
+            except Exception:
+                return (1, s)
+
+        max_total = float(sum(max_by_ex.values()))
+        attrib_total = float(sum(attrib_by_ex.values()))
+
+        lines: list[str] = []
+        lines.append("RÉCAPITULATIF")
+        for ex_code in sorted(max_by_ex.keys(), key=sort_key_ex):
+            mx = float(max_by_ex.get(ex_code, 0.0))
+            at = float(attrib_by_ex.get(ex_code, 0.0))
+            # format compact (préserve la largeur de la marge)
+            lines.append(f"Ex {ex_code} : {at:g}/{mx:g}")
+
+        lines.append("")
+        lines.append(f"Total : {attrib_total:g}/{max_total:g}")
+
+        if max_total > 0:
+            note20 = round(20.0 * attrib_total / max_total, 2)
+            # joli : 14.0 -> 14
+            if abs(note20 - round(note20)) < 1e-9:
+                note20_s = f"{int(round(note20))}"
+            else:
+                note20_s = f"{note20:g}"
+            lines.append(f"Note : {note20_s}/20")
+
+        return "\n".join(lines).strip()
+
+    def c_insert_final_note(self) -> None:
+        if not self._require_doc():
+            return
+        assert self.project is not None
+        doc = self.project.get_current_doc()
+        assert doc is not None
+
+        # S'assure d'avoir la variante marge (base de la régénération)
+        if "margin" not in doc.variants:
+            self._ensure_project_margins()
+        if "margin" not in doc.variants:
+            messagebox.showwarning("Correction", "Impossible de trouver / créer la variante 'margin'.")
+            return
+
+        base_pdf = self.project.rel_to_abs(doc.variants["margin"])
+        if not base_pdf.exists():
+            messagebox.showwarning("Correction", "PDF marge introuvable.")
+            return
+
+        # Page cible
+        target = "first"
+        try:
+            target = str(self.c_final_target_var.get() or "first")
+        except Exception:
+            target = "first"
+
+        page_index = 0
+        if target == "current":
+            try:
+                page_index = int(getattr(self, "_last_interaction_page", 0) or 0)
+            except Exception:
+                page_index = 0
+
+        # Texte
+        text = self._build_final_note_text()
+        if not text:
+            messagebox.showwarning("Correction", "Rien à insérer (projet/document non prêt).")
+            return
+
+        # Rectangle dans la marge gauche
+        left_margin_cm = float(self.project.settings.get("left_margin_cm", 5.0))
+        margin_pt = (left_margin_cm / 2.54) * 72.0
+
+        try:
+            pdf = fitz.open(str(base_pdf))
+            try:
+                if page_index < 0 or page_index >= pdf.page_count:
+                    page_index = 0
+                page = pdf.load_page(page_index)
+                w = float(page.rect.width)
+                h = float(page.rect.height)
+            finally:
+                pdf.close()
+        except Exception:
+            # fallback raisonnable
+            w, h = 595.0, 842.0  # A4 portrait approx.
+
+        x0 = 10.0
+        x1 = min(w - 10.0, max(120.0, margin_pt - 10.0))
+        y0 = 20.0
+        line_count = max(1, len(text.splitlines()))
+        est_h = 13.0 * line_count + 30.0
+        y1 = min(h - 20.0, y0 + max(140.0, est_h))
+
+        rect = [float(x0), float(y0), float(x1), float(y1)]
+
+        anns = self._annotations_for_current_doc()
+        self._remove_final_note_annotations(anns)
+
+        ann = {
+            "id": str(uuid.uuid4()),
+            "kind": "textbox",
+            "page": int(page_index),
+            "rect": rect,
+            "text": text,
+            "style": {"color": "rouge", "fontsize": 11.0, "fontname": "Helvetica", "border_color": "rouge", "border_width_pt": 1.3, "padding_pt": 5.0, "bold_total": True},
+            "payload": {"tag": "final_note"},
+        }
+        anns.append(ann)
+        self.project.save()
+
+        self.c_regenerate()
+        self._refresh_marks_list()
+        self._refresh_correction_totals()
+        self._refresh_info_panel()
+
+    def c_delete_final_note(self) -> None:
+        if not self._require_doc():
+            return
+        anns = self._annotations_for_current_doc()
+        removed = self._remove_final_note_annotations(anns)
+        if not removed:
+            messagebox.showinfo("Correction", "Aucune note finale à supprimer.")
+            return
+        assert self.project is not None
+        self.project.save()
+        self.c_regenerate()
+        self._refresh_marks_list()
+        self._refresh_correction_totals()
+        self._refresh_info_panel()
+
     def _refresh_info_panel(self) -> None:
         if not hasattr(self, "info_tree"):
             return

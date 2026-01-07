@@ -54,11 +54,7 @@ class PDFViewer(ttk.Frame):
 
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-
-        # scroll
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)      # Windows
-        self.canvas.bind_all("<Button-4>", self._on_mousewheel_linux)  # Linux
-        self.canvas.bind_all("<Button-5>", self._on_mousewheel_linux)
+        # scroll (molette) : géré globalement par AppWindow pour éviter de voler la molette partout
 
         self._page_imgs: list[ImageTk.PhotoImage] = []
         self._page_labels: list[tk.Label] = []

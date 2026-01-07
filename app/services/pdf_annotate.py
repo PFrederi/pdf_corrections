@@ -67,6 +67,24 @@ def _norm_rect(rect: List[float]) -> fitz.Rect:
     return r
 
 
+def _insert_text_safe(
+    page: "fitz.Page",
+    point: Tuple[float, float],
+    text: str,
+    fontsize: float,
+    fontname: str,
+    color: Tuple[float, float, float],
+    overlay: bool = True,
+) -> None:
+    """Insère du texte sans casser l'export si la police n'est pas disponible."""
+    try:
+        page.insert_text(point, text, fontsize=fontsize, fontname=fontname, color=color, overlay=overlay)
+    except Exception:
+        try:
+            page.insert_text(point, text, fontsize=fontsize, fontname=fontname, color=color, overlay=overlay)
+        except Exception:
+            page.insert_text(point, text, fontsize=fontsize, color=color, overlay=overlay)
+
 def apply_annotations(
     base_pdf: Path,
     out_pdf: Path,
@@ -112,7 +130,20 @@ def apply_annotations(
                 label_dx = float(style.get("label_dx_pt", radius + 6.0))
 
                 fill = _resolve_color(fill_hex, default_hex=RESULT_COLORS["good"])
-                blue = _resolve_color(LABEL_BLUE, default_hex=LABEL_BLUE)
+
+                # Style du libellé (compat: si absent -> bleu normal)
+                label_style = str(style.get("label_style") or "blue").strip().lower()
+                label_bold = bool(style.get("label_bold", False))
+                label_color_any = style.get("label_color")
+
+                if label_style in ("red_bold", "rouge_gras", "rouge-gras", "red-bold"):
+                    label_bold = True
+                    label_color_any = label_color_any or BASIC_COLORS["rouge"]
+                else:
+                    label_color_any = label_color_any or LABEL_BLUE
+
+                label_color = _resolve_color(label_color_any, default_hex=LABEL_BLUE)
+                label_font = "Helvetica-Bold" if label_bold else "Helvetica"
 
                 shape = page.new_shape()
                 shape.draw_circle((x, y), radius)
@@ -122,14 +153,7 @@ def apply_annotations(
                 if label_text:
                     # Texte à droite (bleu)
                     text_point = (x + label_dx, y + (label_size / 3.0))
-                    page.insert_text(
-                        text_point,
-                        label_text,
-                        fontsize=label_size,
-                        fontname="helv",
-                        color=blue,
-                        overlay=True,
-                    )
+                    _insert_text_safe(page, text_point, label_text, fontsize=label_size, fontname=label_font, color=label_color, overlay=True)
                 continue
 
             # ---------------- Main levée ----------------
@@ -159,23 +183,85 @@ def apply_annotations(
                 r = _norm_rect(rect)
                 if r.is_empty or r.get_area() <= 1:
                     continue
+
                 text = str(ann.get("text") or "").rstrip("\n")
                 if not text:
                     continue
-                color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
-                fontsize = float(style.get("fontsize", 14.0))
-                # pas de cadre, pas de fond => insert_textbox suffit
-                page.insert_textbox(
-                    r,
-                    text,
-                    fontsize=fontsize,
-                    fontname="helv",
-                    color=color,
-                    overlay=True,
-                )
-                continue
 
-            # ---------------- Flèche ----------------
+                payload = ann.get("payload") or {}
+                is_final = isinstance(payload, dict) and payload.get("tag") == "final_note"
+
+                fontsize = float(style.get("fontsize", 14.0))
+                fontname = str(style.get("fontname") or "Helvetica")
+
+                # Couleurs / cadre (optionnels)
+                border_color_name = style.get("border_color")
+                border_width = float(style.get("border_width_pt", 1.2))
+                padding = float(style.get("padding_pt", 4.0))
+                bold_total = bool(style.get("bold_total", False)) or is_final
+
+                if is_final:
+                    # Toujours rouge + encadré (portable en packaging : Helvetica / Helvetica-Bold sont intégrées)
+                    color = _resolve_color("rouge", default_hex=BASIC_COLORS["rouge"])
+                    border_color = _resolve_color("rouge", default_hex=BASIC_COLORS["rouge"])
+                else:
+                    color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
+                    border_color = _resolve_color(border_color_name, default_hex=BASIC_COLORS["bleu"]) if border_color_name else None
+
+                # Encadré (si demandé ou si note finale)
+                if border_color is not None:
+                    try:
+                        page.draw_rect(r, color=border_color, width=border_width, overlay=True)
+                    except Exception:
+                        pass
+
+                # Si on doit mettre une ligne en gras (ex: Total), on dessine ligne par ligne
+                if bold_total:
+                    x = float(r.x0 + padding)
+                    y = float(r.y0 + padding + fontsize)  # baseline
+                    line_h = float(fontsize * 1.25)
+
+                    for line in text.splitlines():
+                        if y > float(r.y1 - padding):
+                            break
+
+                        if not line.strip():
+                            y += line_h
+                            continue
+
+                        use_font = "Helvetica-Bold" if line.strip().lower().startswith("total") else fontname
+                        try:
+                            page.insert_text(
+                                (x, y),
+                                line,
+                                fontsize=fontsize,
+                                fontname=use_font,
+                                color=color,
+                                overlay=True,
+                            )
+                        except Exception:
+                            page.insert_text((x, y), line, fontsize=fontsize, color=color, overlay=True)
+                        y += line_h
+                else:
+                    # Pas de cadre, pas de gras sélectif => insert_textbox suffit
+                    try:
+                        page.insert_textbox(
+                            r,
+                            text,
+                            fontsize=fontsize,
+                            fontname=fontname,
+                            color=color,
+                            overlay=True,
+                        )
+                    except Exception:
+                        page.insert_textbox(
+                            r,
+                            text,
+                            fontsize=fontsize,
+                            color=color,
+                            overlay=True,
+                        )
+# ---------------- Flèche ----------------
             if kind == "arrow":
                 s = ann.get("start")
                 e = ann.get("end")
