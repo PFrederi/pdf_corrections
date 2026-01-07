@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import math
+import sys
 import fitz
 
 from app.services.pdf_margin import cm_to_pt
@@ -57,6 +58,35 @@ def _resolve_color(color_any: Any, default_hex: str = "#111827") -> Tuple[float,
             return _hex_to_rgb01(s)
     return _hex_to_rgb01(default_hex)
 
+def _resolve_font_request(style: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """
+    Retourne (fontname, fontfile).
+    - fontfile peut être fourni via style['fontfile'] (chemin vers un .ttf/.otf fourni par l'utilisateur)
+    - si la police demandée n'est pas garantie (ex: Comic Sans MS), fallback sur Helvetica (portable).
+    """
+    fontname = str(style.get("fontname") or "Helvetica").strip()
+    fontfile = style.get("fontfile")
+    fontfile = str(fontfile).strip() if fontfile else None
+
+    if fontfile:
+        p = Path(fontfile)
+        if p.exists() and p.is_file():
+            return (fontname or "Helvetica"), str(p)
+
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            p2 = Path(base) / fontfile
+            if p2.exists() and p2.is_file():
+                return (fontname or "Helvetica"), str(p2)
+
+        fontfile = None
+
+    low = (fontname or "").lower()
+    if "comic" in low:
+        fontname = "Helvetica"
+
+    return (fontname or "Helvetica"), fontfile
+
 
 def _norm_rect(rect: List[float]) -> fitz.Rect:
     if len(rect) != 4:
@@ -72,18 +102,29 @@ def _insert_text_safe(
     point: Tuple[float, float],
     text: str,
     fontsize: float,
-    fontname: str,
+    fontname: Optional[str],
     color: Tuple[float, float, float],
     overlay: bool = True,
+    fontfile: Optional[str] = None,
 ) -> None:
     """Insère du texte sans casser l'export si la police n'est pas disponible."""
+    kwargs = {"fontsize": fontsize, "color": color, "overlay": overlay}
+
     try:
-        page.insert_text(point, text, fontsize=fontsize, fontname=fontname, color=color, overlay=overlay)
+        if fontfile:
+            page.insert_text(point, text, fontfile=fontfile, fontname=(fontname or "Helvetica"), **kwargs)
+        elif fontname:
+            page.insert_text(point, text, fontname=fontname, **kwargs)
+        else:
+            page.insert_text(point, text, **kwargs)
+        return
     except Exception:
-        try:
-            page.insert_text(point, text, fontsize=fontsize, fontname=fontname, color=color, overlay=overlay)
-        except Exception:
-            page.insert_text(point, text, fontsize=fontsize, color=color, overlay=overlay)
+        pass
+
+    try:
+        page.insert_text(point, text, **kwargs)
+    except Exception:
+        return
 
 def apply_annotations(
     base_pdf: Path,
@@ -192,7 +233,7 @@ def apply_annotations(
                 is_final = isinstance(payload, dict) and payload.get("tag") == "final_note"
 
                 fontsize = float(style.get("fontsize", 14.0))
-                fontname = str(style.get("fontname") or "Helvetica")
+                fontname, fontfile = _resolve_font_request(style)
 
                 # Couleurs / cadre (optionnels)
                 border_color_name = style.get("border_color")
@@ -230,17 +271,7 @@ def apply_annotations(
                             continue
 
                         use_font = "Helvetica-Bold" if line.strip().lower().startswith("total") else fontname
-                        try:
-                            page.insert_text(
-                                (x, y),
-                                line,
-                                fontsize=fontsize,
-                                fontname=use_font,
-                                color=color,
-                                overlay=True,
-                            )
-                        except Exception:
-                            page.insert_text((x, y), line, fontsize=fontsize, color=color, overlay=True)
+                        _insert_text_safe(page, (x, y), line, fontsize=fontsize, fontname=use_font, color=color, overlay=True, fontfile=fontfile)
                         y += line_h
                 else:
                     # Pas de cadre, pas de gras sélectif => insert_textbox suffit
@@ -250,6 +281,7 @@ def apply_annotations(
                             text,
                             fontsize=fontsize,
                             fontname=fontname,
+                            fontfile=fontfile,
                             color=color,
                             overlay=True,
                         )

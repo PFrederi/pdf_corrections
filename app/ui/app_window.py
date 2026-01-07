@@ -8,12 +8,77 @@ import fitz  # PyMuPDF
 import uuid
 import math
 import copy
+import sys
 
 from app.ui.theme import apply_dark_theme, DARK_BG, DARK_BG_2
 from app.core.project import Project
 from app.services.pdf_margin import add_left_margin
 from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
+
+def _sanitize_tk_filetypes(filetypes):
+    """Nettoie les filetypes pour éviter des crashs Tk sur macOS (NSOpenPanel/NSSavePanel).
+
+    Problèmes rencontrés sur macOS:
+    - les patterns catch-all du type "*.*" / "*" peuvent planter Tk
+    - certains patterns sans wildcard (ex: "project.json") peuvent se traduire en extension invalide -> nil
+    """
+    if not filetypes:
+        return None
+
+    def _normalize_pattern(p):
+        p = (p or "").strip()
+        if not p:
+            return None
+        # Convertit un nom de fichier en pattern d'extension
+        if "*" not in p and "?" not in p:
+            suf = Path(p).suffix
+            if suf:
+                return f"*{suf}"
+            return None
+        return p
+
+    clean = []
+    seen = set()
+
+    for item in filetypes:
+        if not item or not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        label, patterns = item
+        label = str(label).strip() if label else "Fichiers"
+
+        raw = []
+        if patterns is None:
+            raw = []
+        elif isinstance(patterns, str):
+            raw = [p for p in patterns.replace(";", " ").split() if p.strip()]
+        elif isinstance(patterns, (list, tuple)):
+            for p in patterns:
+                if isinstance(p, str):
+                    raw.extend([x for x in p.replace(";", " ").split() if x.strip()])
+
+        pats = []
+        for p in raw:
+            np = _normalize_pattern(p)
+            if not np:
+                continue
+            # Sur macOS, évite les entrées catch-all qui peuvent faire planter Tk
+            if sys.platform == "darwin" and np in ("*.*", "*"):
+                continue
+            pats.append(np)
+
+        # dédoublonne en conservant l'ordre
+        dedup = []
+        for p in pats:
+            if p not in seen:
+                seen.add(p)
+                dedup.append(p)
+
+        if not dedup:
+            continue
+        clean.append((label, tuple(dedup) if len(dedup) > 1 else dedup[0]))
+
+    return clean or None
 from app.ui.widgets.pdf_viewer import PDFViewer
 
 from app.core.grading import (
@@ -1335,7 +1400,7 @@ class AppWindow:
     def open_project(self) -> None:
         path = filedialog.askopenfilename(
             title="Ouvrir un projet (project.json)",
-            filetypes=[("Projet JSON", "project.json"), ("JSON", "*.json"), ("Tous fichiers", "*.*")]
+            filetypes=_sanitize_tk_filetypes([("Projet JSON", "project.json"), ("JSON", "*.json"), ("Tous fichiers", "*.*")])
         )
         if not path:
             return
@@ -1816,7 +1881,7 @@ class AppWindow:
         assert self.project is not None
         inp = filedialog.askopenfilename(
             title="Importer un barème (JSON)",
-            filetypes=[("Barème JSON", "*.json"), ("JSON", "*.json"), ("Tous fichiers", "*.*")]
+            filetypes=_sanitize_tk_filetypes([("Barème JSON", "*.json"), ("JSON", "*.json"), ("Tous fichiers", "*.*")])
         )
         if not inp:
             return
