@@ -2551,7 +2551,24 @@ class AppWindow:
         self.project.current_variant = "corrected"
         self.project.save()
 
-        self.viewer.open_pdf(out_pdf, preserve_view=True)
+        # Rafraîchissement robuste (important en version packagée .exe : les exceptions Tk peuvent être silencieuses)
+        def _open_corrected_after_regen():
+            try:
+                self.viewer.open_pdf(out_pdf, preserve_view=True)
+            except TypeError:
+                # Compat avec d'anciennes versions de PDFViewer.open_pdf(pdf_path)
+                self.viewer.open_pdf(out_pdf)
+            except Exception:
+                # dernier recours : retenter un peu plus tard (écriture fichier / cache OS)
+                try:
+                    self.root.after(80, lambda: self.viewer.open_pdf(out_pdf))
+                except Exception:
+                    pass
+        # Laisse Tk finir le callback (menu/context) avant de re-render le canvas
+        try:
+            self.root.after_idle(_open_corrected_after_regen)
+        except Exception:
+            _open_corrected_after_regen()
 
     def c_delete_last(self) -> None:
         if not self._require_doc():

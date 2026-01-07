@@ -75,16 +75,47 @@ class PDFViewer(ttk.Frame):
         self._pdf_path = None
         self.canvas.configure(scrollregion=(0, 0, 1, 1))
 
-    def open_pdf(self, pdf_path: str | Path) -> None:
+    def open_pdf(self, pdf_path: str | Path, preserve_view: bool = False, force_reload: bool = False) -> None:
+        """Ouvre un PDF.
+
+        preserve_view=True conserve le zoom + la position de scroll actuels (utile après régénération du PDF).
+        """
+        prev_zoom = float(getattr(self, "_zoom", 1.0) or 1.0)
+        try:
+            prev_x = self.canvas.xview()
+            prev_y = self.canvas.yview()
+        except Exception:
+            prev_x = (0.0, 1.0)
+            prev_y = (0.0, 1.0)
+
         self._pdf_path = Path(pdf_path)
         if self._doc is not None:
             try:
                 self._doc.close()
             except Exception:
                 pass
-        self._doc = fitz.open(str(self._pdf_path))
-        self._zoom = 1.0
-        self._render_all_pages(reset_view=True)
+        # Ouvre le PDF depuis des bytes pour éviter des soucis de verrouillage/caching (surtout en .exe Windows)
+        try:
+            _data = Path(self._pdf_path).read_bytes()
+            self._doc = fitz.open(stream=_data, filetype='pdf')
+        except Exception:
+            self._doc = fitz.open(str(self._pdf_path))
+
+        if preserve_view:
+            prev_zoom = max(0.2, min(6.0, prev_zoom))
+            self._zoom = prev_zoom
+        else:
+            self._zoom = 1.0
+
+        self._render_all_pages(reset_view=(not preserve_view))
+
+        if preserve_view:
+            try:
+                self.canvas.update_idletasks()
+                self.canvas.xview_moveto(float(prev_x[0]))
+                self.canvas.yview_moveto(float(prev_y[0]))
+            except Exception:
+                pass
 
     def set_interaction_callbacks(
         self,
