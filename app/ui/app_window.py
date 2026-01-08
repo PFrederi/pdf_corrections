@@ -90,7 +90,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.5"
+APP_VERSION = "0.0.4"
 
 
 class AppWindow:
@@ -507,8 +507,33 @@ class AppWindow:
 
     def _build_tab_synthese_note(self) -> None:
         """Onglet: extrait le bloc RÉCAPITULATIF des PDF verrouillés et construit un tableau + CSV."""
-        frm = ttk.Frame(self.tab_synth_note)
-        frm.pack(fill="both", expand=True, padx=12, pady=12)
+        # Conteneur scrollable (pour voir les boutons en bas même sur petits écrans)
+        outer = ttk.Frame(self.tab_synth_note)
+        outer.pack(fill="both", expand=True)
+
+        self.sn_canvas = tk.Canvas(outer, highlightthickness=0)
+        self.sn_vsb = ttk.Scrollbar(outer, orient="vertical", command=self.sn_canvas.yview)
+        self.sn_canvas.configure(yscrollcommand=self.sn_vsb.set)
+
+        self.sn_vsb.pack(side="right", fill="y")
+        self.sn_canvas.pack(side="left", fill="both", expand=True)
+
+        frm = ttk.Frame(self.sn_canvas, padding=(12, 12))
+        win_id = self.sn_canvas.create_window((0, 0), window=frm, anchor="nw")
+
+        def _sn_on_frame_configure(_event=None):
+            # Met à jour la zone scrollable
+            self.sn_canvas.configure(scrollregion=self.sn_canvas.bbox("all"))
+
+        def _sn_on_canvas_configure(event):
+            # Garde la largeur du contenu alignée sur la largeur visible
+            try:
+                self.sn_canvas.itemconfigure(win_id, width=event.width)
+            except Exception:
+                pass
+
+        frm.bind("<Configure>", _sn_on_frame_configure)
+        self.sn_canvas.bind("<Configure>", _sn_on_canvas_configure)
 
         # Etat
         self.sn_pdf_paths: list[Path] = []
