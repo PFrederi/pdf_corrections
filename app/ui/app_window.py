@@ -90,7 +90,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.4"
+APP_VERSION = "0.0.5"
 
 
 class AppWindow:
@@ -285,7 +285,15 @@ class AppWindow:
         ttk.Label(frm, textvariable=self.c_total_var).pack(anchor="w", pady=(0, 8))
 
         self.c_move_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 10))
+        ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 4))
+        self.c_align_margin_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Aligner dans la marge", variable=self.c_align_margin_var).pack(anchor="w", pady=(0, 10))
+        # Affiche/masque la ligne guide d'alignement dans la marge
+        try:
+            self.c_align_margin_var.trace_add("write", lambda *_: self._update_margin_guide())
+        except Exception:
+            pass
+
         ttk.Label(frm, text="Style du libellé :").pack(anchor="w")
         style_row = ttk.Frame(frm)
         style_row.pack(anchor="w", pady=(2, 4))
@@ -317,7 +325,7 @@ class AppWindow:
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Supprimer sélection", command=self.c_delete_selected).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Supprimer sélection", command=(lambda: self.c_delete_selected() if hasattr(self, "c_delete_selected") else self.ann_delete_selected())).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="Supprimer dernière", command=self.c_delete_last).pack(side="left")
 
         ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(10, 8))
@@ -642,9 +650,19 @@ class AppWindow:
                 w = 260 if col == "NOM PRENOM" else 90
                 self.sn_tree.column(col, width=w, minwidth=70, stretch=True, anchor="center")
 
-        def _fill_rows(results, columns):
+        def _fill_rows(results, columns, baremes=None):
             for iid in self.sn_tree.get_children(""):
                 self.sn_tree.delete(iid)
+
+            # Ligne barème en premier (si fournie)
+            if baremes:
+                row_bm = {"NOM PRENOM": "BAREME"}
+                for c in columns:
+                    if c != "NOM PRENOM":
+                        row_bm[c] = baremes.get(c, "")
+                values = [row_bm.get(c, "") for c in columns]
+                self.sn_tree.insert("", "end", values=values)
+
             for r in results:
                 row = {"NOM PRENOM": r.name}
                 row.update(r.scores)
@@ -673,11 +691,23 @@ class AppWindow:
                 return
             out_path = Path(self.sn_out_var.get()).expanduser()
             try:
-                results, columns = recap_collect_results(self.sn_pdf_paths)
-                recap_write_csv(out_path, results, columns)
+                baremes = None
+
+                # Compat: ancienne version (2 retours) / nouvelle version (3 retours: +baremes)
+                try:
+                    results, columns, baremes = recap_collect_results(self.sn_pdf_paths)
+                except ValueError:
+                    results, columns = recap_collect_results(self.sn_pdf_paths)
+
+                # Compat: write_csv(out, results, cols) ou write_csv(out, results, cols, baremes)
+                try:
+                    recap_write_csv(out_path, results, columns, baremes)
+                except TypeError:
+                    recap_write_csv(out_path, results, columns)
+
                 _setup_columns(columns)
-                _fill_rows(results, columns)
-                messagebox.showinfo("Synthèse", f"CSV généré :\n{out_path}")
+                _fill_rows(results, columns, baremes)
+                messagebox.showinfo("Synthèse", f"CSV généré :\\n{out_path}")
             except Exception as e:
                 messagebox.showerror("Erreur", str(e))
 
@@ -730,6 +760,12 @@ class AppWindow:
                         label = "ON"
             self._click_hint.configure(text=f"Mode clic : {label}")
 
+
+        # Met à jour l'affichage de la ligne guide (si activée)
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
 
 
     # ---------------- Outils PDF (annotation) ----------------
@@ -843,6 +879,11 @@ class AppWindow:
                 fn(step_or_factor)
             except Exception:
                 pass
+        # Le zoom re-render le canvas => il faut redessiner la ligne guide
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
 
     def _viewer_zoom_reset(self) -> None:
         v = getattr(self, "viewer", None)
@@ -854,6 +895,11 @@ class AppWindow:
                 fn()
             except Exception:
                 pass
+        # Le zoom re-render le canvas => il faut redessiner la ligne guide
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
 
     def _sync_tool_combo_from_var(self) -> None:
         """Synchronise la combobox d'outils (UI) avec self.ann_tool_var (logique).
@@ -1275,9 +1321,17 @@ class AppWindow:
             kind = orig.get("kind") if isinstance(orig, dict) else None
 
             if kind == "score_circle":
+                # Option "Aligner dans la marge" (Correction V0) : verrouille X à 0,5 cm du bord gauche
                 cx = float(orig.get("x_pt", 0.0)) + dx
                 cy = float(orig.get("y_pt", 0.0)) + dy
-                target["x_pt"] = cx
+                try:
+                    sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+                except Exception:
+                    sub = ""
+                if sub == "Correction V0" and self._corr_align_margin_enabled():
+                    target["x_pt"] = float(self._corr_margin_x_pt())
+                else:
+                    target["x_pt"] = cx
                 target["y_pt"] = cy
                 return
 
@@ -1347,6 +1401,21 @@ class AppWindow:
         if self._draw_kind == "move":
             moved = bool(getattr(self, "_move_has_moved", False))
             if moved and self._require_doc():
+                # Snap X pour les pastilles (score_circle) si "Aligner dans la marge" est coché (Correction V0)
+                try:
+                    sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+                except Exception:
+                    sub = ""
+                if sub == "Correction V0" and self._corr_align_margin_enabled():
+                    try:
+                        anns = self._annotations_for_current_doc()
+                        for a in anns:
+                            if isinstance(a, dict) and str(a.get("id", "")) == str(self._move_ann_id) and a.get("kind") == "score_circle":
+                                a["x_pt"] = float(self._corr_margin_x_pt())
+                                break
+                    except Exception:
+                        pass
+
                 try:
                     # persiste et régénère pour voir le résultat dans la vue PDF
                     self.project.save()
@@ -1576,6 +1645,10 @@ class AppWindow:
 
         self.project.current_doc_id = doc_id
         self.viewer.open_pdf(view_abs)
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
         self.nb.select(self.tab_view)
         self.view_subtabs.select(self.sub_correction)
         self._update_click_mode()
@@ -1597,6 +1670,10 @@ class AppWindow:
             messagebox.showwarning("Correction", "Le PDF corrigé est introuvable.")
             return
         self.viewer.open_pdf(p)
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
 
     # ---------------- Projet ----------------
     def new_project(self) -> None:
@@ -1693,6 +1770,86 @@ class AppWindow:
         except Exception:
             pass
         return False
+
+    # ---------------- Ligne guide : alignement marge (Correction V0) ----------------
+    def _clear_margin_guide(self) -> None:
+        """Supprime la ligne guide d'alignement (si présente)."""
+        try:
+            v = getattr(self, "viewer", None)
+            if v is None:
+                return
+            c = getattr(v, "canvas", None)
+            if c is None:
+                return
+            c.delete("margin_guide")
+        except Exception:
+            pass
+
+    def _update_margin_guide(self) -> None:
+        """Affiche/masque la ligne guide verticale à 0,5 cm (si 'Aligner dans la marge' est coché)."""
+        # Toujours commencer par nettoyer
+        self._clear_margin_guide()
+
+        # Conditions d'affichage : onglet Visualisation PDF + sous-onglet Correction V0 + option cochée
+        try:
+            main = self.nb.tab(self.nb.select(), "text")
+        except Exception:
+            main = ""
+        try:
+            sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+        except Exception:
+            sub = ""
+
+        if main != "Visualisation PDF" or sub != "Correction V0":
+            return
+
+        try:
+            if not bool(self.c_align_margin_var.get()):
+                return
+        except Exception:
+            return
+
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        canvas = getattr(v, "canvas", None)
+        if canvas is None:
+            return
+
+        layout = getattr(v, "_layout", None)
+        if not layout:
+            return
+
+        try:
+            zoom = float(v.get_zoom()) if hasattr(v, "get_zoom") else float(getattr(v, "_zoom", 1.0) or 1.0)
+        except Exception:
+            zoom = 1.0
+
+        # X en pixels : 0,5 cm depuis le bord gauche (points -> pixels via zoom)
+        try:
+            x_px = float(self._corr_margin_x_pt()) * zoom
+        except Exception:
+            return
+
+        for info in layout:
+            try:
+                y0 = float(info.get("y0", 0.0))
+                y1 = y0 + float(info.get("h_px", 0.0))
+            except Exception:
+                continue
+            try:
+                canvas.create_line(
+                    x_px, y0, x_px, y1,
+                    fill="#2F81F7",
+                    width=2,
+                    dash=(6, 4),
+                    tags=("margin_guide",),
+                    state="disabled",
+                )
+            except Exception:
+                pass
+
+
 
     def _on_global_mousewheel(self, event) -> str | None:
         """Route la molette vers la zone sous le curseur (panneau correction ou PDF)."""
@@ -2243,6 +2400,16 @@ class AppWindow:
         attrib = self._doc_attrib_total()
         mx = self._scheme_max_total()
         self.c_total_var.set(f"Total attribué : {attrib:g} / {mx:g}")
+    def _corr_align_margin_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "c_align_margin_var", None).get())
+        except Exception:
+            return False
+
+    def _corr_margin_x_pt(self) -> float:
+        """X (en points PDF) pour aligner une pastille à 0,5 cm du bord gauche."""
+        return float((0.5 / 2.54) * 72.0)
+
 
     def _find_nearest_marker(self, page_index: int, x_pt: float, y_pt: float, threshold_pt: float = 14.0):
         """
@@ -2320,7 +2487,7 @@ class AppWindow:
             "id": str(uuid.uuid4()),
             "kind": "score_circle",
             "page": int(page_index),
-            "x_pt": float(x_pt),
+            "x_pt": float(self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt),
             "y_pt": float(y_pt),
             "exercise_code": code,
             "exercise_label": label,
@@ -2365,9 +2532,11 @@ class AppWindow:
         if int(ann.get("page", -1)) != int(page_index):
             return
 
-        ann["x_pt"] = float(x_pt)
-        ann["y_pt"] = float(y_pt)
+        x_use = self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt
 
+
+        ann["x_pt"] = float(x_use)
+        ann["y_pt"] = float(y_pt)
     def _on_pdf_release_for_correction(self, page_index: int, x_pt: float, y_pt: float) -> None:
         if not (hasattr(self, "c_move_var") and self.c_move_var.get()):
             return
@@ -2377,6 +2546,21 @@ class AppWindow:
             return
 
         assert self.project is not None
+
+        # Applique la position finale au relâchement (plus robuste que dépendre uniquement de <B1-Motion>)
+        try:
+            anns = self._annotations_for_current_doc()
+            idx = int(self._drag_target_idx) if self._drag_target_idx is not None else None
+            if idx is not None and 0 <= idx < len(anns):
+                ann = anns[idx]
+                if isinstance(ann, dict) and ann.get("kind") == "score_circle":
+                    x_use = self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt
+                    ann["page"] = int(page_index)
+                    ann["x_pt"] = float(x_use)
+                    ann["y_pt"] = float(y_pt)
+        except Exception:
+            pass
+
         self.project.save()
 
         # Re-génère pour appliquer le déplacement dans le PDF
@@ -2404,7 +2588,7 @@ class AppWindow:
             "id": str(uuid.uuid4()),
             "kind": "score_circle",
             "page": int(page_index),
-            "x_pt": float(x_pt),
+            "x_pt": float(self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt),
             "y_pt": float(y_pt),
             "exercise_code": code,
             "exercise_label": label or code,
@@ -2555,9 +2739,17 @@ class AppWindow:
         def _open_corrected_after_regen():
             try:
                 self.viewer.open_pdf(out_pdf, preserve_view=True)
+                try:
+                    self._update_margin_guide()
+                except Exception:
+                    pass
             except TypeError:
                 # Compat avec d'anciennes versions de PDFViewer.open_pdf(pdf_path)
                 self.viewer.open_pdf(out_pdf)
+                try:
+                    self._update_margin_guide()
+                except Exception:
+                    pass
             except Exception:
                 # dernier recours : retenter un peu plus tard (écriture fichier / cache OS)
                 try:
