@@ -7,6 +7,7 @@ import sys
 import fitz
 
 from app.services.pdf_margin import cm_to_pt
+from app.services.pdf_images import insert_image as _insert_pdf_image
 
 
 def _hex_to_rgb01(hex_color: str) -> Tuple[float, float, float]:
@@ -130,6 +131,7 @@ def apply_annotations(
     base_pdf: Path,
     out_pdf: Path,
     annotations: List[Dict[str, Any]],
+    project_root: Optional[Path] = None,
 ) -> None:
     """
     Applique les annotations:
@@ -137,6 +139,7 @@ def apply_annotations(
     - ink: trait main levée (polyline)
     - textbox: zone de texte (sans cadre / fond transparent)
     - arrow: flèche (ligne + tête)
+    - image: insertion d'un PNG (rect)
     """
     base_pdf = Path(base_pdf)
     out_pdf = Path(out_pdf)
@@ -195,6 +198,35 @@ def apply_annotations(
                     # Texte à droite (bleu)
                     text_point = (x + label_dx, y + (label_size / 3.0))
                     _insert_text_safe(page, text_point, label_text, fontsize=label_size, fontname=label_font, color=label_color, overlay=True)
+                continue
+
+            # ---------------- Image (PNG) ----------------
+            if kind == "image":
+                rect = ann.get("rect")
+                if not (isinstance(rect, list) and len(rect) == 4):
+                    continue
+                r = _norm_rect(rect)
+                if r.is_empty or r.get_area() <= 1:
+                    continue
+
+                style = ann.get("style") or {}
+                keep_prop = bool(style.get("keep_proportion", True))
+                opacity = style.get("opacity")
+
+                # Résolution du chemin image : priorise image_rel (portabilité du projet)
+                img_ref = str(ann.get("image_rel") or ann.get("image_path") or "").strip()
+                if not img_ref:
+                    continue
+
+                img_path = Path(img_ref)
+                if not img_path.is_absolute():
+                    if project_root:
+                        img_path = Path(project_root) / img_ref
+                    else:
+                        # fallback : relatif au PDF de base
+                        img_path = base_pdf.parent / img_ref
+
+                _insert_pdf_image(page, r, img_path, keep_proportion=keep_prop, overlay=True, opacity=opacity)
                 continue
 
             # ---------------- Main levée ----------------

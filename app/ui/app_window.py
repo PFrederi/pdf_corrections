@@ -16,6 +16,7 @@ from app.services.pdf_margin import add_left_margin
 from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
 from app.services.pdf_recap_to_csv_table_fixed2 import collect_results as recap_collect_results, write_csv as recap_write_csv
+from app.ui.image_tool import ImageStampTool
 
 def _sanitize_tk_filetypes(filetypes):
     """Nettoie les filetypes pour éviter des crashs Tk sur macOS (NSOpenPanel/NSSavePanel).
@@ -90,7 +91,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.4"
+APP_VERSION = "0.0.5"
 
 
 class AppWindow:
@@ -112,13 +113,14 @@ class AppWindow:
         self.c_label_style_var.trace_add("write", lambda *_: self._on_pastille_label_style_changed())
 
         # Outils d'annotation classiques (Visualisation PDF)
-        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow
+        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow | image
         self.ann_color_var = tk.StringVar(value="bleu")  # couleur trait / flèche
         self.ann_width_var = tk.IntVar(value=3)          # épaisseur trait / flèche
 
         self.text_color_var = tk.StringVar(value="bleu") # couleur police
         self.text_size_var = tk.IntVar(value=14)         # taille police
         self.text_value_var = tk.StringVar(value="")     # texte à placer (optionnel)
+
 
         # Sélection d'annotations (outil 'Sélection')
         self._selected_ann_ids: set[str] = set()
@@ -141,7 +143,8 @@ class AppWindow:
         self._move_snapshot: dict | None = None
         self._move_has_moved: bool = False
 
-
+        # Outil "Image (PNG)" : géré dans un module séparé pour ne pas alourdir app_window.py
+        self.image_tool = ImageStampTool(self)
         # --- Barre haute ---
         top = ttk.Frame(root)
         top.pack(fill="x", padx=10, pady=10)
@@ -816,6 +819,7 @@ class AppWindow:
             ("Main levée", "ink"),
             ("Texte", "textbox"),
             ("Flèche", "arrow"),
+            ("Image (PNG)", "image"),
         ]
         self._tool_label_var = tk.StringVar(value="Aucun")
         self._tool_combo = ttk.Combobox(
@@ -886,6 +890,12 @@ class AppWindow:
 
         self._text_size_spin = ttk.Spinbox(row, from_=8, to=72, width=5, textvariable=self.text_size_var)
         self._text_size_spin.pack(side="left", padx=(6, 0))
+
+        # Outil images (PNG)
+        try:
+            self.image_tool.build_ui(parent)
+        except Exception:
+            pass
 
         self._update_annot_toolbar_state()
 
@@ -1051,18 +1061,41 @@ class AppWindow:
             set_state(ann_text, False)
             set_state(txt_color, False)
             set_state(txt_size, False)
+            try:
+                self.image_tool.set_enabled(False)
+            except Exception:
+                pass
         elif tool == "textbox":
             set_state(ann_color, False)
             set_state(ann_width, False)
             set_state(ann_text, True)
             set_state(txt_color, True)
             set_state(txt_size, True)
+            try:
+                self.image_tool.set_enabled(False)
+            except Exception:
+                pass
+        elif tool == "image":
+            # insertion d'image : on désactive les réglages d'encre/texte
+            set_state(ann_color, False)
+            set_state(ann_width, False)
+            set_state(ann_text, False)
+            set_state(txt_color, False)
+            set_state(txt_size, False)
+            try:
+                self.image_tool.set_enabled(True)
+            except Exception:
+                pass
         else:
             set_state(ann_color, False)
             set_state(ann_width, False)
             set_state(ann_text, False)
             set_state(txt_color, False)
             set_state(txt_size, False)
+            try:
+                self.image_tool.set_enabled(False)
+            except Exception:
+                pass
 
         has_sel = bool(getattr(self, "_selected_ann_ids", set()))
         set_state(getattr(self, "_btn_del_sel", None), has_sel)
@@ -1201,6 +1234,24 @@ class AppWindow:
             d = math.hypot(dx, dy)
             return d if d <= pad else None
 
+        # Image : rect (même hit-test que textbox)
+        if kind == "image":
+            rect = ann.get("rect")
+            if not (isinstance(rect, list) and len(rect) == 4):
+                return None
+            x0, y0, x1, y1 = [float(v) for v in rect]
+            if x0 > x1:
+                x0, x1 = x1, x0
+            if y0 > y1:
+                y0, y1 = y1, y0
+            pad = 8.0
+            if (x0 - pad) <= x_pt <= (x1 + pad) and (y0 - pad) <= y_pt <= (y1 + pad):
+                return 0.0
+            dx = 0.0 if x0 <= x_pt <= x1 else min(abs(x_pt - x0), abs(x_pt - x1))
+            dy = 0.0 if y0 <= y_pt <= y1 else min(abs(y_pt - y0), abs(y_pt - y1))
+            d = math.hypot(dx, dy)
+            return d if d <= pad else None
+
         # Flèche : segment start-end
         if kind == "arrow":
             try:
@@ -1305,7 +1356,7 @@ class AppWindow:
                 self._draw_points = [(float(x_pt), float(y_pt))]
                 return
 
-            if tool in ("arrow", "textbox"):
+            if tool in ("arrow", "textbox", "image"):
                 self._draw_start = (float(x_pt), float(y_pt))
                 self._draw_end = (float(x_pt), float(y_pt))
                 return
@@ -1371,6 +1422,17 @@ class AppWindow:
                     ]
                 return
 
+            if kind == "image":
+                rect = orig.get("rect")
+                if isinstance(rect, (list, tuple)) and len(rect) == 4:
+                    target["rect"] = [
+                        float(rect[0]) + dx,
+                        float(rect[1]) + dy,
+                        float(rect[2]) + dx,
+                        float(rect[3]) + dy,
+                    ]
+                return
+
             if kind == "arrow":
                 s = orig.get("start")
                 e = orig.get("end")
@@ -1407,7 +1469,7 @@ class AppWindow:
                     self._draw_points.append((float(x_pt), float(y_pt)))
                 return
 
-            if self._draw_kind in ("arrow", "textbox"):
+            if self._draw_kind in ("arrow", "textbox", "image"):
                 self._draw_end = (float(x_pt), float(y_pt))
                 return
 
@@ -1507,6 +1569,35 @@ class AppWindow:
                     anns.append(ann)
                     self.project.save()
                     self.c_regenerate()
+                self._reset_draw_state()
+                return
+
+            if tool == "image":
+                s = self._draw_start
+                e = self._draw_end or (float(x_pt), float(y_pt))
+                if not s or not e:
+                    self._reset_draw_state()
+                    return
+
+                # construit une annotation image via le module (gestion bibliothèque / ratio)
+                try:
+                    ann = self.image_tool.build_annotation(
+                        int(page_index),
+                        (float(s[0]), float(s[1])),
+                        (float(e[0]), float(e[1])),
+                        (float(x_pt), float(y_pt)),
+                    )
+                except Exception:
+                    ann = None
+
+                if not ann:
+                    messagebox.showwarning("Image", "Aucune image sélectionnée (ou bibliothèque vide).")
+                    self._reset_draw_state()
+                    return
+
+                anns.append(ann)
+                self.project.save()
+                self.c_regenerate()
                 self._reset_draw_state()
                 return
 
@@ -1721,6 +1812,12 @@ class AppWindow:
             pass
         self.project.save()
 
+        # recharge la bibliothèque d'images (outil Image)
+        try:
+            self.image_tool.refresh_options()
+        except Exception:
+            pass
+
         self.project_name_var.set(self.project.name)
         self._refresh_files_list()
         self.viewer.clear()
@@ -1751,6 +1848,12 @@ class AppWindow:
         except Exception:
             pass
         self.project.save()
+
+        # recharge la bibliothèque d'images (outil Image)
+        try:
+            self.image_tool.refresh_options()
+        except Exception:
+            pass
 
         self._ensure_project_margins()
 
@@ -2751,7 +2854,7 @@ class AppWindow:
         anns = self._annotations_for_current_doc()
         out_pdf = self.project.unique_work_path(f"{doc.id}__corrected.pdf")
         try:
-            apply_annotations(base_pdf, out_pdf, anns)
+            apply_annotations(base_pdf, out_pdf, anns, project_root=self.project.root_dir)
         except Exception as e:
             messagebox.showerror("Correction", f"Erreur génération corrigé.\n\n{e}")
             return
