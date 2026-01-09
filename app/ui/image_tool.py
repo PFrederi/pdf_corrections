@@ -21,6 +21,8 @@ from app.ui.image_library import (
     add_category,
     add_images_to_library,
     remove_image_from_library,
+    export_library_to_zip,
+    import_library_from_zip,
     DEFAULT_CATEGORY,
 )
 
@@ -46,6 +48,8 @@ class ImageStampTool:
         self._combo: Optional[ttk.Combobox] = None
         self._cat_combo: Optional[ttk.Combobox] = None
         self._btn_new_cat: Optional[ttk.Button] = None
+        self._btn_export: Optional[ttk.Button] = None
+        self._btn_import: Optional[ttk.Button] = None
         self._btn_add: Optional[ttk.Button] = None
         self._btn_del: Optional[ttk.Button] = None
         self._width_spin: Optional[ttk.Spinbox] = None
@@ -70,6 +74,12 @@ class ImageStampTool:
 
         self._btn_new_cat = ttk.Button(row_cat, text="Nouvelle…", command=self._on_new_category)
         self._btn_new_cat.pack(side="left")
+
+        self._btn_export = ttk.Button(row_cat, text="Exporter…", command=self._on_export_library)
+        self._btn_export.pack(side="left", padx=(10, 4))
+
+        self._btn_import = ttk.Button(row_cat, text="Importer…", command=self._on_import_library)
+        self._btn_import.pack(side="left")
 
         row = ttk.Frame(parent)
         row.pack(fill="x", padx=10, pady=(0, 10))
@@ -106,6 +116,16 @@ class ImageStampTool:
         if self._btn_new_cat is not None:
             try:
                 self._btn_new_cat.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+        if self._btn_export is not None:
+            try:
+                self._btn_export.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+        if self._btn_import is not None:
+            try:
+                self._btn_import.configure(state="normal" if enabled else "disabled")
             except Exception:
                 pass
         state = "readonly" if enabled else "disabled"
@@ -252,6 +272,92 @@ class ImageStampTool:
             return
 
         self.refresh_options()
+
+    def _on_export_library(self) -> None:
+        prj = getattr(self.app, "project", None)
+        if prj is None:
+            messagebox.showwarning("Images", "Veuillez d'abord créer / ouvrir un projet.")
+            return
+
+        parent = getattr(self.app, "root", None)
+        try:
+            if parent is not None:
+                parent.update_idletasks()
+                parent.lift()
+                parent.focus_force()
+        except Exception:
+            pass
+
+        selected_cat = (self.category_var.get() or "Tous").strip() or "Tous"
+        initialfile = "image_library.zip" if selected_cat == "Tous" else f"images_{selected_cat}.zip"
+
+        kwargs = {
+            "title": "Exporter la bibliothèque d'images",
+            "defaultextension": ".zip",
+            "filetypes": [("Archive ZIP", "*.zip")],
+            "initialfile": initialfile,
+        }
+        try:
+            if getattr(prj, "root_dir", None):
+                kwargs["initialdir"] = str(prj.root_dir)
+            if isinstance(parent, tk.Misc):
+                kwargs["parent"] = parent
+        except Exception:
+            pass
+
+        dest = filedialog.asksaveasfilename(**kwargs)
+        if not dest:
+            return
+
+        ok, msg = export_library_to_zip(prj, dest, category=selected_cat)
+        if ok:
+            messagebox.showinfo("Images", msg)
+        else:
+            messagebox.showwarning("Images", msg)
+
+    def _on_import_library(self) -> None:
+        prj = getattr(self.app, "project", None)
+        if prj is None:
+            messagebox.showwarning("Images", "Veuillez d'abord créer / ouvrir un projet.")
+            return
+
+        parent = getattr(self.app, "root", None)
+        try:
+            if parent is not None:
+                parent.update_idletasks()
+                parent.lift()
+                parent.focus_force()
+        except Exception:
+            pass
+
+        kwargs = {
+            "title": "Importer une bibliothèque d'images",
+            "filetypes": [("Archive ZIP", "*.zip")],
+        }
+        try:
+            if getattr(prj, "root_dir", None):
+                kwargs["initialdir"] = str(prj.root_dir)
+            if isinstance(parent, tk.Misc):
+                kwargs["parent"] = parent
+        except Exception:
+            pass
+
+        src = filedialog.askopenfilename(**kwargs)
+        if not src:
+            return
+
+        ok, msg = import_library_from_zip(prj, src, mode="merge", category_override=None)
+        if not ok:
+            messagebox.showwarning("Images", msg)
+            return
+
+        try:
+            prj.save()
+        except Exception:
+            pass
+
+        self.refresh_options()
+        messagebox.showinfo("Images", msg)
 
     # ---------------- Library actions ----------------
     def _on_add_images(self) -> None:

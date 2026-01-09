@@ -17,6 +17,7 @@ from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
 from app.services.pdf_recap_to_csv_table_fixed2 import collect_results as recap_collect_results, write_csv as recap_write_csv
 from app.ui.image_tool import ImageStampTool
+from app.ui.widgets.scrollable_frame import VScrollableFrame
 
 def _sanitize_tk_filetypes(filetypes):
     """Nettoie les filetypes pour éviter des crashs Tk sur macOS (NSOpenPanel/NSSavePanel).
@@ -91,7 +92,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.5"
+APP_VERSION = "0.6.5"
 
 
 class AppWindow:
@@ -188,6 +189,8 @@ class AppWindow:
         self.root.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._on_global_mousewheel_linux, add="+")
         self.root.bind_all("<Button-5>", self._on_global_mousewheel_linux, add="+")
+        # Raccourci ergonomique : masquer/afficher le panneau de gauche (Correction/Infos) pour agrandir la vue PDF
+        self.root.bind("<F8>", lambda _e: self._toggle_view_left_pane(), add="+")
 
     # ---------------- UI : Import/Projet ----------------
     def _build_tab_project(self) -> None:
@@ -245,6 +248,48 @@ class AppWindow:
 
         self._click_hint = ttk.Label(self.view_left, text="Mode clic : OFF")
         self._click_hint.pack(anchor="w", padx=10, pady=(6, 6))
+
+
+    def _toggle_view_left_pane(self) -> None:
+        """Masque/affiche le panneau de gauche (Correction/Infos) pour agrandir la vue PDF.
+
+        Raccourci : F8
+        """
+        pane = getattr(self, "view_pane", None)
+        left = getattr(self, "view_left", None)
+        if pane is None or left is None:
+            return
+
+        hidden = bool(getattr(self, "_view_left_hidden", False))
+
+        if not hidden:
+            # Mémorise (si possible) la position du séparateur
+            try:
+                self._view_left_prev_sash = pane.sashpos(0)
+            except Exception:
+                self._view_left_prev_sash = None
+            try:
+                pane.forget(left)
+            except Exception:
+                return
+            self._view_left_hidden = True
+        else:
+            # Réinsère à gauche
+            try:
+                pane.insert(0, left, weight=0)
+            except Exception:
+                try:
+                    pane.add(left, weight=0)
+                except Exception:
+                    return
+            # Restaure la position du séparateur si dispo
+            try:
+                pos = getattr(self, "_view_left_prev_sash", None)
+                if pos is not None and hasattr(pane, "sashpos"):
+                    pane.sashpos(0, pos)
+            except Exception:
+                pass
+            self._view_left_hidden = False
     def _build_view_correction_panel(self) -> None:
         # Zone scrollable : indispensable quand la fenêtre est petite (sinon les boutons du bas disparaissent)
         outer = ttk.Frame(self.sub_correction)
@@ -798,22 +843,34 @@ class AppWindow:
 
     # ---------------- Outils PDF (annotation) ----------------
     def _build_pdf_toolbar(self, parent: ttk.Frame) -> None:
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x", padx=10, pady=(10, 0))
+        """Barre d'outils plus ergonomique pour maximiser la zone de visualisation.
 
-        ttk.Label(bar, text="Outils :").pack(side="left")
+        Toujours visibles (comme demandé) :
+        - Zoom (- / 100% / +)
+        - Outil "Sélection"
+        - Combobox des outils
+        - Boutons "Supprimer sélection" et "Désélectionner"
+
+        Les réglages détaillés (couleur/épaisseur/texte/images, etc.) sont déplacés
+        dans un panneau "Options" repliable.
+        """
+
+        # --- Ligne 1 (compacte) : choix d'outil ---
+        bar1 = ttk.Frame(parent)
+        bar1.pack(fill="x", padx=10, pady=(10, 0))
+
+        ttk.Label(bar1, text="Outils :").pack(side="left")
 
         # Mode sélection (permet de sélectionner + déplacer par glisser-déposer)
         self._sel_toggle = ttk.Checkbutton(
-            bar,
+            bar1,
             text="Sélection",
             variable=self.sel_mode_var,
             command=self._on_sel_toggle,
         )
         self._sel_toggle.pack(side="left", padx=(8, 8))
 
-        # Combobox (plus robuste que des boutons côte-à-côte : évite que des outils soient cachés
-        # quand la fenêtre est étroite ou en HiDPI)
+        # Combobox d'outils (robuste en HiDPI)
         self._tool_map = [
             ("Aucun", "none"),
             ("Main levée", "ink"),
@@ -823,18 +880,22 @@ class AppWindow:
         ]
         self._tool_label_var = tk.StringVar(value="Aucun")
         self._tool_combo = ttk.Combobox(
-            bar,
+            bar1,
             state="readonly",
             width=14,
             values=[t for t, _v in self._tool_map],
             textvariable=self._tool_label_var,
         )
-        self._tool_combo.pack(side="left", padx=(8, 0))
+        self._tool_combo.pack(side="left", padx=(0, 10))
         self._tool_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_tool_combo())
         self._sync_tool_combo_from_var()
 
+        # Bouton Options (repliable)
+        self._pdf_opts_open_var = tk.BooleanVar(value=False)
+        self._btn_pdf_opts = ttk.Button(bar1, text="Options ▸", command=self._toggle_pdf_options)
+        self._btn_pdf_opts.pack(side="left")
 
-        # Ligne 2 : sélection / suppression (évite que des boutons soient cachés en HiDPI)
+        # --- Ligne 2 (compacte) : sélection + zoom ---
         bar2 = ttk.Frame(parent)
         bar2.pack(fill="x", padx=10, pady=(6, 0))
 
@@ -844,23 +905,32 @@ class AppWindow:
         self._btn_clear_sel = ttk.Button(bar2, text="Désélectionner", command=self.ann_clear_selection)
         self._btn_clear_sel.pack(side="left")
 
-
-        # Zoom (utile quand on zoome : + / - / reset)
+        # Zoom (à droite)
         zoom_box = ttk.Frame(bar2)
         zoom_box.pack(side="right")
         ttk.Button(zoom_box, text="Zoom -", width=8, command=lambda: self._viewer_zoom(-1)).pack(side="left", padx=(0, 4))
         ttk.Button(zoom_box, text="100%", width=6, command=self._viewer_zoom_reset).pack(side="left", padx=(0, 4))
         ttk.Button(zoom_box, text="Zoom +", width=8, command=lambda: self._viewer_zoom(+1)).pack(side="left")
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=(6, 6))
+        # Séparateur fin (compact)
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=(6, 4))
 
-        row = ttk.Frame(parent)
-        row.pack(fill="x", padx=10, pady=(0, 6))
+        # --- Panneau Options (repliable) ---
+        # NOTE : on ne le pack PAS ici (caché par défaut)
+        # Panneau scrollable pour ne pas écraser la zone PDF quand les options sont longues
+        self._pdf_opts_container = VScrollableFrame(parent, height=200)
+        self._pdf_opts_inner = self._pdf_opts_container.inner
 
-        # Couleur trait / flèche
-        ttk.Label(row, text="Couleur :").pack(side="left")
+        ttk.Label(self._pdf_opts_inner, text="Options de l'outil sélectionné :").pack(anchor="w", padx=10, pady=(0, 4))
+
+        # 1) Options trait/flèche
+        self._opts_ink_arrow = ttk.Frame(self._pdf_opts_inner)
+        row_ia = ttk.Frame(self._opts_ink_arrow)
+        row_ia.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(row_ia, text="Couleur :").pack(side="left")
         self._ann_color_combo = ttk.Combobox(
-            row,
+            row_ia,
             width=10,
             state="readonly",
             values=["rouge", "bleu", "vert", "violet", "marron", "noir"],
@@ -868,19 +938,22 @@ class AppWindow:
         )
         self._ann_color_combo.pack(side="left", padx=(6, 12))
 
-        # Épaisseur
-        ttk.Label(row, text="Épaisseur :").pack(side="left")
-        self._ann_width_spin = ttk.Spinbox(row, from_=1, to=20, width=5, textvariable=self.ann_width_var)
-        self._ann_width_spin.pack(side="left", padx=(6, 12))
+        ttk.Label(row_ia, text="Épaisseur :").pack(side="left")
+        self._ann_width_spin = ttk.Spinbox(row_ia, from_=1, to=20, width=5, textvariable=self.ann_width_var)
+        self._ann_width_spin.pack(side="left", padx=(6, 0))
 
-        # Texte
-        ttk.Label(row, text="Texte :").pack(side="left")
-        self._ann_text_entry = ttk.Entry(row, textvariable=self.text_value_var, width=22)
+        # 2) Options texte
+        self._opts_text = ttk.Frame(self._pdf_opts_inner)
+        row_tx = ttk.Frame(self._opts_text)
+        row_tx.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(row_tx, text="Texte :").pack(side="left")
+        self._ann_text_entry = ttk.Entry(row_tx, textvariable=self.text_value_var, width=24)
         self._ann_text_entry.pack(side="left", padx=(6, 12))
 
-        ttk.Label(row, text="Police :").pack(side="left")
+        ttk.Label(row_tx, text="Couleur :").pack(side="left")
         self._text_color_combo = ttk.Combobox(
-            row,
+            row_tx,
             width=10,
             state="readonly",
             values=["rouge", "bleu", "vert", "violet", "marron", "noir"],
@@ -888,21 +961,102 @@ class AppWindow:
         )
         self._text_color_combo.pack(side="left", padx=(6, 8))
 
-        self._text_size_spin = ttk.Spinbox(row, from_=8, to=72, width=5, textvariable=self.text_size_var)
+        ttk.Label(row_tx, text="Taille :").pack(side="left")
+        self._text_size_spin = ttk.Spinbox(row_tx, from_=8, to=72, width=5, textvariable=self.text_size_var)
         self._text_size_spin.pack(side="left", padx=(6, 0))
 
-        # Outil images (PNG)
+        # 3) Options images (PNG)
+        self._opts_image = ttk.Frame(self._pdf_opts_inner)
         try:
-            self.image_tool.build_ui(parent)
+            self.image_tool.build_ui(self._opts_image)
         except Exception:
             pass
 
+        # état initial
         self._update_annot_toolbar_state()
 
+    def _toggle_pdf_options(self) -> None:
+        """Affiche/masque le panneau Options (repliable) pour gagner de la place."""
+        var = getattr(self, "_pdf_opts_open_var", None)
+        if var is None:
+            return
+        try:
+            visible = not bool(var.get())
+            var.set(visible)
+        except Exception:
+            visible = True
+        self._set_pdf_options_visible(visible)
 
+    def _set_pdf_options_visible(self, visible: bool) -> None:
+        cont = getattr(self, "_pdf_opts_container", None)
+        if cont is None:
+            return
+        try:
+            if visible:
+                cont.pack(fill="x", padx=0, pady=(0, 4))
+            else:
+                cont.pack_forget()
+        except Exception:
+            pass
 
+        btn = getattr(self, "_btn_pdf_opts", None)
+        if btn is not None:
+            try:
+                btn.configure(text=("Options ▾" if visible else "Options ▸"))
+            except Exception:
+                pass
 
-    # ---------------- PDF Viewer helpers ----------------
+        # met à jour les frames visibles selon l'outil courant
+        try:
+            self._update_annot_toolbar_state()
+        except Exception:
+            pass
+
+    def _show_pdf_tool_options(self, tool: str) -> None:
+        """Affiche uniquement les options pertinentes pour l'outil courant."""
+        var = getattr(self, "_pdf_opts_open_var", None)
+        if var is None:
+            return
+        try:
+            if not bool(var.get()):
+                return
+        except Exception:
+            return
+
+        frames = [
+            getattr(self, "_opts_ink_arrow", None),
+            getattr(self, "_opts_text", None),
+            getattr(self, "_opts_image", None),
+        ]
+        for fr in frames:
+            if fr is None:
+                continue
+            try:
+                fr.pack_forget()
+            except Exception:
+                pass
+
+        if tool in ("ink", "arrow"):
+            fr = getattr(self, "_opts_ink_arrow", None)
+            if fr is not None:
+                fr.pack(fill="x", padx=0, pady=(0, 0))
+        elif tool == "textbox":
+            fr = getattr(self, "_opts_text", None)
+            if fr is not None:
+                fr.pack(fill="x", padx=0, pady=(0, 0))
+        elif tool == "image":
+            fr = getattr(self, "_opts_image", None)
+            if fr is not None:
+                fr.pack(fill="x", padx=0, pady=(0, 0))
+
+        # Remet le scroll en haut (utile si l'utilisateur a scrollé dans les options)
+        cont = getattr(self, "_pdf_opts_container", None)
+        if cont is not None:
+            try:
+                cont.scroll_to_top()
+            except Exception:
+                pass
+# ---------------- PDF Viewer helpers ----------------
     def _viewer_zoom(self, step_or_factor: float) -> None:
         """Zoom du PDF (step +1/-1 ou facteur 1.1/0.9)."""
         v = getattr(self, "viewer", None)
@@ -1096,6 +1250,13 @@ class AppWindow:
                 self.image_tool.set_enabled(False)
             except Exception:
                 pass
+
+
+        # Affiche uniquement les options utiles (si le panneau Options est ouvert)
+        try:
+            self._show_pdf_tool_options(tool)
+        except Exception:
+            pass
 
         has_sel = bool(getattr(self, "_selected_ann_ids", set()))
         set_state(getattr(self, "_btn_del_sel", None), has_sel)

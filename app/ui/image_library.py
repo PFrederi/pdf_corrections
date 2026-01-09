@@ -28,8 +28,12 @@ Compat :
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+import json
 import shutil
+import tempfile
 import uuid
+import zipfile
 
 from PIL import Image
 
@@ -253,6 +257,27 @@ def _is_rel_used_in_annotations(project: Project, image_rel: str) -> bool:
     return False
 
 
+def _count_rel_in_library(project: Project, image_rel: str) -> int:
+    """Compte combien d'entrées de bibliothèque pointent vers un même fichier rel."""
+    lib = _ensure_library_list(project)
+    rel = str(image_rel or "").replace("\\", "/")
+    if not rel:
+        return 0
+    n = 0
+    for it in lib:
+        if isinstance(it, dict) and str(it.get("rel") or "").replace("\\", "/") == rel:
+            n += 1
+    return n
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def remove_image_from_library(project: Project, image_id: str) -> Tuple[bool, str]:
     """Supprime une entrée de bibliothèque.
 
@@ -288,12 +313,237 @@ def remove_image_from_library(project: Project, image_id: str) -> Tuple[bool, st
         pass
     project.settings["image_library"] = lib
 
-    # supprime le fichier (best-effort)
+    # supprime le fichier (best-effort) uniquement si plus aucune autre entrée
+    # ne pointe dessus (sinon on casserait d'autres catégories/entrées).
     try:
-        p = resolve_image_abs(project, rel)
-        if p.exists() and p.is_file():
-            p.unlink()
+        if rel and _count_rel_in_library(project, rel) <= 0:
+            p = resolve_image_abs(project, rel)
+            if p.exists() and p.is_file():
+                p.unlink()
     except Exception:
         pass
 
     return True, "Image supprimée."
+
+
+# ---------------------------------------------------------------------------
+# Export / Import de bibliothèque (ZIP)
+# ---------------------------------------------------------------------------
+
+
+EXPORT_MANIFEST_NAME = "image_library.json"
+
+
+def export_library_to_zip(
+    project: Project,
+    dest_zip: str | Path,
+    category: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Exporte les catégories + images associées dans un fichier ZIP.
+
+    - Si category est None ou "Tous" => export complet
+    - Sinon => n'exporte que cette catégorie
+    """
+    dest = Path(dest_zip).expanduser().resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    lib = _ensure_library_list(project)
+    cats = _ensure_categories_list(project)
+
+    cat = (category or "").strip()
+    if not cat or cat.lower() == "tous":
+        selected = lib
+        export_cats = cats
+    else:
+        selected = [it for it in lib if str(it.get("category") or "") == cat]
+        export_cats = [cat]
+
+    if not selected:
+        return False, "Aucune image à exporter pour cette catégorie."
+
+    manifest = {
+        "version": 1,
+        "categories": export_cats,
+        "images": [],
+    }
+
+    # On stocke les fichiers sous images/<filename>
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for it in selected:
+            rel = str(it.get("rel") or "")
+            if not rel:
+                continue
+            abs_path = resolve_image_abs(project, rel)
+            if not abs_path.exists() or not abs_path.is_file():
+                # on conserve l'entrée mais marque "missing"
+                rec = {
+                    "name": str(it.get("name") or ""),
+                    "category": str(it.get("category") or DEFAULT_CATEGORY),
+                    "rel": rel,
+                    "filename": Path(rel).name,
+                    "sha256": "",
+                    "w_px": int(it.get("w_px") or 0),
+                    "h_px": int(it.get("h_px") or 0),
+                    "missing": True,
+                }
+                manifest["images"].append(rec)
+                continue
+
+            sha = ""
+            try:
+                sha = _sha256_file(abs_path)
+            except Exception:
+                sha = ""
+
+            arcname = Path("images") / abs_path.name
+            zf.write(abs_path, arcname.as_posix())
+
+            rec = {
+                "name": str(it.get("name") or abs_path.stem),
+                "category": str(it.get("category") or DEFAULT_CATEGORY),
+                "filename": abs_path.name,
+                "sha256": sha,
+                "w_px": int(it.get("w_px") or 0),
+                "h_px": int(it.get("h_px") or 0),
+            }
+            manifest["images"].append(rec)
+
+        zf.writestr(EXPORT_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
+
+    return True, "Bibliothèque exportée."
+
+
+def import_library_from_zip(
+    project: Project,
+    src_zip: str | Path,
+    mode: str = "merge",
+    category_override: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Importe une bibliothèque d'images depuis un ZIP.
+
+    Args:
+        mode:
+          - "merge" (défaut) : ajoute/merge categories + images
+          - "replace" : remplace la bibliothèque/catégories par celles du ZIP (⚠ ne supprime pas les fichiers existants)
+        category_override:
+          - si fourni, force toutes les images importées dans cette catégorie.
+
+    Notes:
+        - Déduplication : si un fichier importé a le même sha256 qu'un fichier existant,
+          on réutilise le même fichier (rel) mais on crée une nouvelle entrée de bibliothèque
+          si la catégorie diffère.
+    """
+    src = Path(src_zip).expanduser().resolve()
+    if not src.exists() or not src.is_file():
+        return False, "Fichier ZIP introuvable."
+
+    dest_dir = ensure_images_dir(project)
+
+    with zipfile.ZipFile(src, "r") as zf:
+        if EXPORT_MANIFEST_NAME not in zf.namelist():
+            return False, f"ZIP invalide : {EXPORT_MANIFEST_NAME} manquant."
+        try:
+            manifest = json.loads(zf.read(EXPORT_MANIFEST_NAME).decode("utf-8"))
+        except Exception:
+            return False, "ZIP invalide : manifeste illisible."
+
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("images"), list):
+            return False, "ZIP invalide : format du manifeste incorrect."
+
+        # mode replace : on remplace settings, mais on ne supprime pas physiquement les fichiers
+        if mode == "replace":
+            project.settings["image_library"] = []
+            project.settings["image_categories"] = [DEFAULT_CATEGORY]
+
+        # catégories
+        cats_in = manifest.get("categories")
+        if isinstance(cats_in, list):
+            for c in cats_in:
+                if isinstance(c, str) and c.strip():
+                    add_category(project, c)
+
+        # index existant par sha256 et par rel
+        existing = _ensure_library_list(project)
+        sha_to_rel: Dict[str, str] = {}
+        for it in existing:
+            rel = str(it.get("rel") or "")
+            if not rel:
+                continue
+            ap = resolve_image_abs(project, rel)
+            if ap.exists() and ap.is_file():
+                try:
+                    sha = _sha256_file(ap)
+                    if sha:
+                        sha_to_rel.setdefault(sha, rel)
+                except Exception:
+                    pass
+
+        created = 0
+        skipped_missing = 0
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for rec in manifest.get("images", []):
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("missing") is True:
+                    skipped_missing += 1
+                    continue
+
+                filename = str(rec.get("filename") or "").strip()
+                if not filename:
+                    continue
+                zpath = Path("images") / filename
+                if zpath.as_posix() not in zf.namelist():
+                    skipped_missing += 1
+                    continue
+
+                # catégorie finale
+                cat = _normalize_category(category_override or str(rec.get("category") or DEFAULT_CATEGORY))
+                add_category(project, cat)
+
+                # extrait en tmp
+                out = tmp / filename
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(zpath.as_posix(), "r") as src_f, out.open("wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f)
+
+                # calc sha
+                sha = ""
+                try:
+                    sha = _sha256_file(out)
+                except Exception:
+                    sha = str(rec.get("sha256") or "")
+
+                # si on a déjà ce contenu, on réutilise le même fichier
+                if sha and sha in sha_to_rel:
+                    rel = sha_to_rel[sha]
+                else:
+                    # copie vers projet avec nom unique
+                    stem = Path(filename).stem
+                    safe_stem = "".join(ch for ch in stem if (ch.isalnum() or ch in ("-", "_", " "))).strip()
+                    safe_stem = safe_stem.replace(" ", "_") or "image"
+                    dest_name = f"{safe_stem}_{uuid.uuid4().hex[:6]}.png"
+                    dest_path = (dest_dir / dest_name).resolve()
+                    shutil.copy2(out, dest_path)
+                    rel = Path(IMAGES_DIR_REL, dest_name).as_posix()
+                    if sha:
+                        sha_to_rel[sha] = rel
+
+                entry = {
+                    "id": uuid.uuid4().hex,
+                    "name": str(rec.get("name") or Path(filename).stem or "image"),
+                    "rel": rel,
+                    "category": cat,
+                    "w_px": int(rec.get("w_px") or 0),
+                    "h_px": int(rec.get("h_px") or 0),
+                }
+                existing.append(entry)
+                created += 1
+
+        project.settings["image_library"] = existing
+
+    msg = f"Import terminé : {created} image(s) ajoutée(s)."
+    if skipped_missing:
+        msg += f" ({skipped_missing} image(s) manquante(s) ignorée(s))"
+    return True, msg

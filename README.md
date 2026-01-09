@@ -31,6 +31,11 @@ python -m app.main
 -   Correction V0 : ajout d'une fonction d'alignement dans la marge
 -   Récapitulatif des notes par la lectures des PDF corrigés
 -   export du tableau des notes au format PRONOTE pour pouvoir importer directement dans PRONOTE
+-   Ajout possible d'images dans le PDF au format PDF
+-   Gestion complète des images par catégorie personnalisable
+-   Possibilités d'exporter la librairie des images (totale ou par catégorie) pour réutilisation ultérieure
+-   Modification des menus dans "Visualisation PDF" pour prendre plus d'ergonomie
+-   Touche "F8" pour passer en mode plein écran de la copie
 
 ## Outils d'annotation (Visualisation PDF)
 
@@ -38,6 +43,7 @@ python -m app.main
 -   **Texte** : sélectionner l'outil, régler police (couleur/taille), optionnellement saisir le texte dans le champ
     (sinon une fenêtre demande le texte). Cliquer-glisser pour définir une zone.
 -   **Flèche** : sélectionner l'outil, choisir couleur + épaisseur, puis cliquer-glisser pour définir la flèche.
+-   **Image** : sélectionner l'outil, choisir l'image (PNG) à insérer.
 
 Remarque : les annotations sont appliquées via la variante **corrected** (régénérée automatiquement à la fin du
 glisser).
