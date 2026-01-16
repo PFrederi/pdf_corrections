@@ -34,13 +34,17 @@ class PDFViewer(ttk.Frame):
         self.canvas = tk.Canvas(outer, bg=self._bg, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
-        self.vbar = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.vbar = ttk.Scrollbar(outer, orient="vertical", command=self._on_yview)
         self.vbar.grid(row=0, column=1, sticky="ns")
 
-        self.hbar = ttk.Scrollbar(outer, orient="horizontal", command=self.canvas.xview)
+        self.hbar = ttk.Scrollbar(outer, orient="horizontal", command=self._on_xview)
         self.hbar.grid(row=1, column=0, sticky="ew")
 
         self.canvas.configure(yscrollcommand=self.vbar.set, xscrollcommand=self.hbar.set)
+
+        # lazy re-render (pour open_pdf(..., lazy_render=True))
+        self._lazy_rerender_enabled: bool = False
+        self._lazy_rerender_after_id = None
 
         # état PDF
         self._doc: Optional[fitz.Document] = None
@@ -73,9 +77,17 @@ class PDFViewer(ttk.Frame):
                 pass
         self._doc = None
         self._pdf_path = None
+        self._lazy_rerender_enabled = False
+        self._lazy_rerender_after_id = None
         self.canvas.configure(scrollregion=(0, 0, 1, 1))
 
-    def open_pdf(self, pdf_path: str | Path, preserve_view: bool = False, force_reload: bool = False) -> None:
+    def open_pdf(
+        self,
+        pdf_path: str | Path,
+        preserve_view: bool = False,
+        force_reload: bool = False,
+        lazy_render: bool = False,
+    ) -> None:
         """Ouvre un PDF.
 
         preserve_view=True conserve le zoom + la position de scroll actuels (utile après régénération du PDF).
@@ -89,6 +101,7 @@ class PDFViewer(ttk.Frame):
             prev_y = (0.0, 1.0)
 
         self._pdf_path = Path(pdf_path)
+        self._lazy_rerender_enabled = bool(lazy_render)
         if self._doc is not None:
             try:
                 self._doc.close()
@@ -107,7 +120,13 @@ class PDFViewer(ttk.Frame):
         else:
             self._zoom = 1.0
 
-        self._render_all_pages(reset_view=(not preserve_view))
+        # lazy_render=True : on garde le layout/canvas existant si compatible et on ne re-render
+        # que les pages visibles (énorme gain de perf après régénération fréquente).
+        self._lazy_rerender_enabled = bool(lazy_render)
+        if lazy_render and self._layout and len(self._layout) == self._doc.page_count and preserve_view:
+            self._render_visible_pages()
+        else:
+            self._render_all_pages(reset_view=(not preserve_view))
 
         if preserve_view:
             try:
@@ -116,6 +135,41 @@ class PDFViewer(ttk.Frame):
                 self.canvas.yview_moveto(float(prev_y[0]))
             except Exception:
                 pass
+
+        if lazy_render and preserve_view:
+            # après restauration du scroll, re-render à nouveau les pages visibles pour être sûr
+            # d'afficher la version à jour (sinon on peut rester sur les anciennes images)
+            try:
+                self._render_visible_pages()
+            except Exception:
+                pass
+
+    def _schedule_visible_rerender(self, delay_ms: int = 80) -> None:
+        if not self._lazy_rerender_enabled:
+            return
+        try:
+            if self._lazy_rerender_after_id is not None:
+                self.after_cancel(self._lazy_rerender_after_id)
+        except Exception:
+            pass
+        try:
+            self._lazy_rerender_after_id = self.after(delay_ms, self._render_visible_pages)
+        except Exception:
+            self._lazy_rerender_after_id = None
+
+    def _on_yview(self, *args):
+        """Proxy yview (scrollbar) pour pouvoir déclencher le lazy refresh."""
+        try:
+            self.canvas.yview(*args)
+        finally:
+            self._schedule_visible_rerender()
+
+    def _on_xview(self, *args):
+        """Proxy xview (scrollbar) pour pouvoir déclencher le lazy refresh."""
+        try:
+            self.canvas.xview(*args)
+        finally:
+            self._schedule_visible_rerender()
 
     def set_interaction_callbacks(
         self,
@@ -234,7 +288,7 @@ class PDFViewer(ttk.Frame):
 
             x0 = 0
             y0 = y
-            self.canvas.create_image(x0, y0, anchor="nw", image=tk_img)
+            item_id = self.canvas.create_image(x0, y0, anchor="nw", image=tk_img, tags=(f"pdf_page_{i}",))
             self._img_refs.append(tk_img)
 
             self._layout.append({
@@ -245,6 +299,7 @@ class PDFViewer(ttk.Frame):
                 "h_px": pix.height,
                 "w_pt": w_pt,
                 "h_pt": h_pt,
+                "item_id": item_id,
             })
 
             y = y0 + pix.height + margin
@@ -261,6 +316,87 @@ class PDFViewer(ttk.Frame):
                 self.canvas.xview_moveto(0.0)
             except Exception:
                 pass
+
+    def _visible_page_indices(self) -> list[int]:
+        """Retourne les indices de pages qui intersectent la zone visible du canvas."""
+        if not self._layout:
+            return []
+        try:
+            h = int(self.canvas.winfo_height() or 0)
+        except Exception:
+            h = 0
+        if h <= 0:
+            return [0]
+        try:
+            top = float(self.canvas.canvasy(0))
+            bot = float(self.canvas.canvasy(h))
+        except Exception:
+            top, bot = 0.0, 1e9
+
+        out: list[int] = []
+        for d in self._layout:
+            try:
+                y0 = float(d.get("y0", 0.0))
+                hp = float(d.get("h_px", 0.0))
+                i = int(d.get("page_index", 0))
+            except Exception:
+                continue
+            if (y0 + hp) >= top - 2 and y0 <= bot + 2:
+                out.append(i)
+        # garde un nombre raisonnable (dans 99% des cas, 1-2 pages)
+        if len(out) > 4:
+            out = out[:4]
+        return out
+
+    def _render_visible_pages(self) -> None:
+        """Re-render uniquement les pages visibles (lazy)."""
+        if not self._doc or not self._layout:
+            return
+        for i in self._visible_page_indices():
+            self._rerender_page(i)
+
+    def _rerender_page(self, page_index: int) -> None:
+        """Re-render d'une page sans recalculer tout le layout."""
+        if not self._doc:
+            return
+        if page_index < 0 or page_index >= self._doc.page_count:
+            return
+        if not self._layout or page_index >= len(self._layout):
+            return
+
+        d = self._layout[page_index]
+        item_id = d.get("item_id")
+        if not item_id:
+            return
+
+        page = self._doc.load_page(page_index)
+        mat = fitz.Matrix(self._zoom, self._zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        tk_img = ImageTk.PhotoImage(img)
+
+        # maj image
+        try:
+            self.canvas.itemconfig(item_id, image=tk_img)
+        except Exception:
+            # fallback : recrée l'item
+            try:
+                x0 = float(d.get("x0", 0.0))
+                y0 = float(d.get("y0", 0.0))
+                self.canvas.delete(item_id)
+                new_id = self.canvas.create_image(x0, y0, anchor="nw", image=tk_img, tags=(f"pdf_page_{page_index}",))
+                d["item_id"] = new_id
+            except Exception:
+                pass
+
+        # conserve la référence (sinon garbage collected)
+        try:
+            self._img_refs[page_index] = tk_img
+        except Exception:
+            # fallback : étend si nécessaire
+            while len(self._img_refs) <= page_index:
+                self._img_refs.append(tk_img)
+            self._img_refs[page_index] = tk_img
 
     # ---------------- Zoom / Scroll ----------------
     def _bind_scroll(self) -> None:
@@ -282,6 +418,7 @@ class PDFViewer(ttk.Frame):
         else:
             step = int(-1 * (delta / 120))
         self.canvas.yview_scroll(step, "units")
+        self._schedule_visible_rerender()
 
     def _on_shift_mousewheel(self, e):
         # horizontal scroll (shift + wheel)
@@ -291,6 +428,7 @@ class PDFViewer(ttk.Frame):
         else:
             step = int(-1 * (delta / 120))
         self.canvas.xview_scroll(step, "units")
+        self._schedule_visible_rerender()
 
     def _on_ctrl_mousewheel(self, e):
         # zoom (Ctrl + wheel)
@@ -302,15 +440,19 @@ class PDFViewer(ttk.Frame):
             self.zoom_out()
     def _on_linux_wheel_up(self, _e):
         self.canvas.yview_scroll(-3, "units")
+        self._schedule_visible_rerender()
 
     def _on_linux_wheel_down(self, _e):
         self.canvas.yview_scroll(3, "units")
+        self._schedule_visible_rerender()
 
     def _on_linux_shift_wheel_up(self, _e):
         self.canvas.xview_scroll(-3, "units")
+        self._schedule_visible_rerender()
 
     def _on_linux_shift_wheel_down(self, _e):
         self.canvas.xview_scroll(3, "units")
+        self._schedule_visible_rerender()
 
     # ---------------- Coordinate mapping + events ----------------
     def _event_to_canvas_xy(self, e) -> tuple[float, float]:

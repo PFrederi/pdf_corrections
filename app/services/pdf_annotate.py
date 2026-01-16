@@ -288,43 +288,67 @@ def apply_annotations(
                     except Exception:
                         pass
 
-                # Si on doit mettre une ligne en gras (ex: Total), on dessine ligne par ligne
-                if bold_total:
-                    x = float(r.x0 + padding)
-                    y = float(r.y0 + padding + fontsize)  # baseline
-                    line_h = float(fontsize * 1.25)
+                # Robustesse multi-lignes : on dessine ligne par ligne.
+                # Pourquoi ?
+                # - certains environnements PyMuPDF/packaging peuvent mal gérer les sauts de ligne
+                #   avec insert_textbox (symptôme : seule la 1ère ligne apparaît)
+                # - cela donne un résultat prévisible et permet d'ajuster facilement la hauteur.
+                x = float(r.x0 + padding)
+                y = float(r.y0 + padding + fontsize)  # baseline
+                line_h = float(fontsize * 1.25)
+                max_w = float(r.width - 2 * padding)
 
-                    for line in text.splitlines():
+                def _text_len(s: str) -> float:
+                    try:
+                        # PyMuPDF: mesure en points
+                        return float(fitz.get_text_length(s, fontname=fontname, fontsize=fontsize))
+                    except Exception:
+                        # fallback heuristique
+                        return float(len(s) * fontsize * 0.55)
+
+                def _wrap_line(raw: str) -> list[str]:
+                    raw = raw.rstrip("\n")
+                    if not raw:
+                        return [""]
+                    # si déjà OK, pas de wrap
+                    if _text_len(raw) <= max_w:
+                        return [raw]
+                    words = raw.split(" ")
+                    out: list[str] = []
+                    cur = ""
+                    for w in words:
+                        cand = (cur + " " + w).strip() if cur else w
+                        if _text_len(cand) <= max_w or not cur:
+                            cur = cand
+                        else:
+                            out.append(cur)
+                            cur = w
+                    if cur:
+                        out.append(cur)
+                    return out or [raw]
+
+                # Si on doit mettre une ligne en gras (ex: Total), on ne wrap pas (garde le style simple)
+                # et on applique la règle "Total".
+                lines_src = text.splitlines() if text is not None else []
+                for src_line in lines_src:
+                    if y > float(r.y1 - padding):
+                        break
+                    if src_line == "":
+                        y += line_h
+                        continue
+
+                    if bold_total:
+                        use_font = "Helvetica-Bold" if src_line.strip().lower().startswith("total") else fontname
+                        _insert_text_safe(page, (x, y), src_line, fontsize=fontsize, fontname=use_font, color=color, overlay=True, fontfile=fontfile)
+                        y += line_h
+                        continue
+
+                    # mode normal : wrap doux par mots
+                    for wrapped in _wrap_line(src_line):
                         if y > float(r.y1 - padding):
                             break
-
-                        if not line.strip():
-                            y += line_h
-                            continue
-
-                        use_font = "Helvetica-Bold" if line.strip().lower().startswith("total") else fontname
-                        _insert_text_safe(page, (x, y), line, fontsize=fontsize, fontname=use_font, color=color, overlay=True, fontfile=fontfile)
+                        _insert_text_safe(page, (x, y), wrapped, fontsize=fontsize, fontname=fontname, color=color, overlay=True, fontfile=fontfile)
                         y += line_h
-                else:
-                    # Pas de cadre, pas de gras sélectif => insert_textbox suffit
-                    try:
-                        page.insert_textbox(
-                            r,
-                            text,
-                            fontsize=fontsize,
-                            fontname=fontname,
-                            fontfile=fontfile,
-                            color=color,
-                            overlay=True,
-                        )
-                    except Exception:
-                        page.insert_textbox(
-                            r,
-                            text,
-                            fontsize=fontsize,
-                            color=color,
-                            overlay=True,
-                        )
 # ---------------- Flèche ----------------
             if kind == "arrow":
                 s = ann.get("start")
@@ -366,6 +390,8 @@ def apply_annotations(
 
         if out_pdf.exists():
             out_pdf.unlink()
-        doc.save(str(out_pdf), garbage=4, deflate=True)
+        # garbage=4 est très lent sur des régénérations fréquentes (placement d'annotations).
+        # garbage=1 garde un PDF propre tout en restant beaucoup plus rapide.
+        doc.save(str(out_pdf), garbage=1, deflate=True)
     finally:
         doc.close()

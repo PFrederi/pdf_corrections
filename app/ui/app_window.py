@@ -83,6 +83,7 @@ def _sanitize_tk_filetypes(filetypes):
 
     return clean or None
 from app.ui.widgets.pdf_viewer import PDFViewer
+from app.ui.widgets.multiline_text_dialog import MultiLineTextDialog
 
 from app.core.grading import (
     ensure_scheme_dict, scheme_from_dict, scheme_to_dict,
@@ -92,7 +93,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.6.5"
+APP_VERSION = "0.0.5"
 
 
 class AppWindow:
@@ -126,8 +127,9 @@ class AppWindow:
         # Sélection d'annotations (outil 'Sélection')
         self._selected_ann_ids: set[str] = set()
         self._sel_info_var = tk.StringVar(value="Sélection : 0")
-        self.sel_mode_var = tk.BooleanVar(value=True)
-        self.sel_mode_var.trace_add("write", lambda *_: self._update_click_mode())
+        self.sel_mode_var = tk.BooleanVar(value=False)
+        self.sel_mode_var.trace_add("write", lambda *_: self._on_sel_mode_changed())
+        self._sync_tool_sel_guard = False  # évite les boucles tool<->sélection
 
 
         # Etat runtime (drag)
@@ -137,12 +139,20 @@ class AppWindow:
         self._draw_start: tuple[float, float] | None = None
         self._draw_end: tuple[float, float] | None = None
 
+        # Robustesse : empêche une régénération PDF (open_pdf) de tomber au milieu
+        # d'une interaction souris (clic-glisser / relâchement). Sinon, on peut
+        # perdre l'événement <ButtonRelease> et l'insertion suivante "ne fait rien".
+        self._pdf_mouse_down: bool = False
+
         # Déplacement d'annotations (outil "Déplacer")
         self._move_active: bool = False
         self._move_ann_id: str | None = None
         self._move_anchor: tuple[float, float] | None = None
         self._move_snapshot: dict | None = None
         self._move_has_moved: bool = False
+
+        # Régénération PDF (debounce) : évite de régénérer trop souvent et améliore la robustesse
+        self._regen_after_id = None
 
         # Outil "Image (PNG)" : géré dans un module séparé pour ne pas alourdir app_window.py
         self.image_tool = ImageStampTool(self)
@@ -182,7 +192,7 @@ class AppWindow:
 
         self.nb.bind("<<NotebookTabChanged>>", self._update_click_mode)
         # Rafraîchit le mode de clic quand l'outil change
-        self.ann_tool_var.trace_add("write", lambda *_: (self._sync_tool_combo_from_var(), self._update_annot_toolbar_state(), self._update_click_mode()))
+        self.ann_tool_var.trace_add("write", lambda *_: self._on_annot_tool_changed())
         self.ann_color_var.trace_add("write", lambda *_: self._update_click_mode())
 
         # Molette souris / trackpad : route le scroll vers la zone sous le curseur (PDF à droite ou panneau Correction V0 à gauche)
@@ -789,12 +799,22 @@ class AppWindow:
         _setup_columns(["NOM PRENOM", "Total"])
 
     def _update_click_mode(self, _evt=None) -> None:
-        main = self.nb.tab(self.nb.select(), "text")
-        sub = ""
+        # IMPORTANT: ne pas baser la logique sur le texte des onglets (fragile si renommage).
+        # On compare directement les ids Tk des widgets.
+        main_sel = ""
         try:
-            sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+            main_sel = str(self.nb.select())
         except Exception:
-            sub = ""
+            main_sel = ""
+
+        sub_sel = ""
+        try:
+            sub_sel = str(self.view_subtabs.select())
+        except Exception:
+            sub_sel = ""
+
+        in_view_tab = (main_sel == str(self.tab_view))
+        in_correction_subtab = (sub_sel == str(getattr(self, "sub_correction", "")))
 
         tool = self.ann_tool_var.get() if hasattr(self, "ann_tool_var") else "none"
         sel_on = False
@@ -803,7 +823,9 @@ class AppWindow:
         except Exception:
             sel_on = False
 
-        enabled = (main == "Visualisation PDF") and ((sub == "Correction V0") or (tool != "none") or sel_on)
+        # Robustesse: tant qu'on est dans l'onglet de visualisation, on laisse les callbacks actifs.
+        # Le handler décidera ensuite quoi faire (pastilles / outil / sélection).
+        enabled = bool(in_view_tab)
 
         self.viewer.set_interaction_callbacks(
             click_cb=self._on_pdf_click if enabled else None,
@@ -815,7 +837,7 @@ class AppWindow:
         if hasattr(self, "_click_hint"):
             label = "OFF"
             if enabled:
-                if sub == "Correction V0":
+                if in_correction_subtab:
                     label = "ON • pastilles"
                 else:
                     sel = False
@@ -942,18 +964,33 @@ class AppWindow:
         self._ann_width_spin = ttk.Spinbox(row_ia, from_=1, to=20, width=5, textvariable=self.ann_width_var)
         self._ann_width_spin.pack(side="left", padx=(6, 0))
 
-        # 2) Options texte
+        # 2) Options texte (multi-lignes)
         self._opts_text = ttk.Frame(self._pdf_opts_inner)
-        row_tx = ttk.Frame(self._opts_text)
-        row_tx.pack(fill="x", padx=10, pady=(0, 6))
 
-        ttk.Label(row_tx, text="Texte :").pack(side="left")
-        self._ann_text_entry = ttk.Entry(row_tx, textvariable=self.text_value_var, width=24)
-        self._ann_text_entry.pack(side="left", padx=(6, 12))
+        ttk.Label(self._opts_text, text="Texte :").pack(anchor="w", padx=10)
+        box_tx = ttk.Frame(self._opts_text)
+        box_tx.pack(fill="x", padx=10, pady=(0, 6))
 
-        ttk.Label(row_tx, text="Couleur :").pack(side="left")
+        self._ann_text_widget = tk.Text(box_tx, height=4, wrap="word")
+        self._ann_text_widget.pack(side="left", fill="x", expand=True)
+        sb_tx = ttk.Scrollbar(box_tx, orient="vertical", command=self._ann_text_widget.yview)
+        sb_tx.pack(side="right", fill="y")
+        self._ann_text_widget.configure(yscrollcommand=sb_tx.set)
+
+        # on initialise depuis la var (compat)
+        try:
+            init_txt = self.text_value_var.get() or ""
+            if init_txt:
+                self._ann_text_widget.insert("1.0", init_txt)
+        except Exception:
+            pass
+
+        row_tx2 = ttk.Frame(self._opts_text)
+        row_tx2.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(row_tx2, text="Couleur :").pack(side="left")
         self._text_color_combo = ttk.Combobox(
-            row_tx,
+            row_tx2,
             width=10,
             state="readonly",
             values=["rouge", "bleu", "vert", "violet", "marron", "noir"],
@@ -961,8 +998,8 @@ class AppWindow:
         )
         self._text_color_combo.pack(side="left", padx=(6, 8))
 
-        ttk.Label(row_tx, text="Taille :").pack(side="left")
-        self._text_size_spin = ttk.Spinbox(row_tx, from_=8, to=72, width=5, textvariable=self.text_size_var)
+        ttk.Label(row_tx2, text="Taille :").pack(side="left")
+        self._text_size_spin = ttk.Spinbox(row_tx2, from_=8, to=72, width=5, textvariable=self.text_size_var)
         self._text_size_spin.pack(side="left", padx=(6, 0))
 
         # 3) Options images (PNG)
@@ -1089,6 +1126,60 @@ class AppWindow:
             self._update_margin_guide()
         except Exception:
             pass
+
+    def _on_annot_tool_changed(self) -> None:
+        """Rend l'outil d'annotation et le mode Sélection mutuellement exclusifs.
+
+        Problème corrigé : si Sélection est activé, un clic sur une annotation existante
+        sélectionne/déplace au lieu d'insérer (ce qui donne l'impression que l'insertion ne marche plus).
+        """
+        if getattr(self, '_sync_tool_sel_guard', False):
+            return
+        self._sync_tool_sel_guard = True
+        try:
+            tool = 'none'
+            try:
+                tool = self.ann_tool_var.get()
+            except Exception:
+                tool = 'none'
+
+            # Si un outil est sélectionné, on désactive le mode Sélection
+            if tool and tool != 'none':
+                try:
+                    if bool(self.sel_mode_var.get()):
+                        self.sel_mode_var.set(False)
+                except Exception:
+                    pass
+
+            self._sync_tool_combo_from_var()
+            self._update_annot_toolbar_state()
+            self._update_click_mode()
+        finally:
+            self._sync_tool_sel_guard = False
+
+    def _on_sel_mode_changed(self) -> None:
+        """Active Sélection => désactive l'outil actif (mutuellement exclusif)."""
+        if getattr(self, '_sync_tool_sel_guard', False):
+            return
+        self._sync_tool_sel_guard = True
+        try:
+            sel = False
+            try:
+                sel = bool(self.sel_mode_var.get())
+            except Exception:
+                sel = False
+
+            if sel:
+                try:
+                    if self.ann_tool_var.get() != 'none':
+                        self.ann_tool_var.set('none')
+                except Exception:
+                    pass
+
+            self._update_annot_toolbar_state()
+            self._update_click_mode()
+        finally:
+            self._sync_tool_sel_guard = False
 
     def _sync_tool_combo_from_var(self) -> None:
         """Synchronise la combobox d'outils (UI) avec self.ann_tool_var (logique).
@@ -1268,6 +1359,34 @@ class AppWindow:
             return BASIC_COLORS[key]
         return BASIC_COLORS.get(default_name, "#3B82F6")
 
+    def _get_text_tool_content(self) -> str:
+        """Retourne le contenu du champ texte (multi-lignes)."""
+        w = getattr(self, "_ann_text_widget", None)
+        if w is not None:
+            try:
+                return str(w.get("1.0", "end-1c"))
+            except Exception:
+                pass
+        try:
+            return str(self.text_value_var.get() or "")
+        except Exception:
+            return ""
+
+    def _set_text_tool_content(self, text: str) -> None:
+        """Met à jour le champ texte (multi-lignes) + la var compat."""
+        try:
+            self.text_value_var.set(text)
+        except Exception:
+            pass
+        w = getattr(self, "_ann_text_widget", None)
+        if w is not None:
+            try:
+                w.delete("1.0", "end")
+                if text:
+                    w.insert("1.0", text)
+            except Exception:
+                pass
+
     def _reset_draw_state(self) -> None:
         self._draw_kind = None
         self._draw_page = None
@@ -1280,6 +1399,47 @@ class AppWindow:
         self._move_anchor = None
         self._move_snapshot = None
         self._move_has_moved = False
+
+    # ---------------- Régénération (debounce) ----------------
+    def _schedule_regenerate(self, delay_ms: int = 140) -> None:
+        """Planifie une régénération du PDF corrigé en 'debounce'.
+
+        Permet d'enchaîner plusieurs insertions (texte, flèches, images…) sans
+        payer le coût d'une régénération complète à chaque clic. Améliore aussi
+        la robustesse (moins de rechargements PDF au milieu des interactions).
+        """
+        try:
+            if self._regen_after_id is not None:
+                self.root.after_cancel(self._regen_after_id)
+        except Exception:
+            pass
+        self._regen_after_id = None
+
+        # Si pas de projet/doc actif, on ne fait rien.
+        if not self.project or not self.project.get_current_doc():
+            return
+
+        def _run():
+            self._regen_after_id = None
+            try:
+                # Si l'utilisateur est en train de cliquer / glisser dans le PDF,
+                # on décale la régénération : sinon open_pdf(...) peut interrompre
+                # l'interaction et faire "disparaître" les insertions suivantes.
+                if bool(getattr(self, "_pdf_mouse_down", False)) or getattr(self, "_draw_kind", None):
+                    self._schedule_regenerate(delay_ms=120)
+                    return
+                self.c_regenerate()
+            except Exception:
+                # c_regenerate affiche déjà des messagebox si besoin
+                pass
+
+        try:
+            self._regen_after_id = self.root.after(max(20, int(delay_ms)), _run)
+        except Exception:
+            try:
+                _run()
+            except Exception:
+                pass
 
     # ---------------- Sélection / suppression d'annotations ----------------
     def _update_selection_info(self) -> None:
@@ -1470,9 +1630,39 @@ class AppWindow:
 
 
     def _on_pdf_click(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        # marque le début d'une interaction souris sur le canvas PDF (utilisé par le debounce regen)
+        self._pdf_mouse_down = True
         self._last_interaction_page = int(page_index)
-        # Priorité : si le mode sélection est activé et qu'on clique sur une annotation,
-        # on sélectionne puis on prépare un déplacement (glisser-déposer).
+        # 1) Outils d'annotation (Texte / Flèche / Encre / Image)
+        # Priorité volontaire : si un outil est actif, on insère même si "Sélection" est cochée.
+        # Sinon, un clic près d'une annotation existante (ex: la zone de texte insérée juste avant)
+        # déclenche un déplacement au lieu d'une nouvelle insertion, ce qui donne l'impression que
+        # "ça ne marche plus".
+        tool = self.ann_tool_var.get()
+        if tool != "none":
+            if not self._require_doc():
+                return
+
+            # Pour éviter toute confusion, on efface la sélection courante dès qu'on est en mode insertion.
+            if self._selected_ann_ids:
+                self._selected_ann_ids.clear()
+                self._update_selection_info()
+
+            self._draw_kind = tool
+            self._draw_page = int(page_index)
+
+            if tool == "ink":
+                self._draw_points = [(float(x_pt), float(y_pt))]
+                return
+
+            if tool in ("arrow", "textbox", "image"):
+                self._draw_start = (float(x_pt), float(y_pt))
+                self._draw_end = (float(x_pt), float(y_pt))
+                return
+
+            return
+
+        # 2) Mode sélection : si on clique sur une annotation, on la sélectionne et on prépare un déplacement.
         sel_on = False
         try:
             sel_on = bool(self.sel_mode_var.get())
@@ -1500,29 +1690,10 @@ class AppWindow:
                     self._click_hint.configure(text="Mode clic : ON • sélection/déplacement (glisse pour déplacer)")
                 return
             else:
-                # clic dans le vide : on désélectionne, mais on laisse les outils d'annotation fonctionner
+                # clic dans le vide : on désélectionne
                 if self._selected_ann_ids:
                     self._selected_ann_ids.clear()
                     self._update_selection_info()
-
-        # 1) outils d'annotation ?
-        tool = self.ann_tool_var.get()
-        if tool != "none":
-            if not self._require_doc():
-                return
-            self._draw_kind = tool
-            self._draw_page = int(page_index)
-
-            if tool == "ink":
-                self._draw_points = [(float(x_pt), float(y_pt))]
-                return
-
-            if tool in ("arrow", "textbox", "image"):
-                self._draw_start = (float(x_pt), float(y_pt))
-                self._draw_end = (float(x_pt), float(y_pt))
-                return
-
-            return
 
         # 2) sinon: pastilles (Correction V0 uniquement)
         try:
@@ -1616,8 +1787,9 @@ class AppWindow:
             return
 
         # 2) dessin (outil combo)
-        tool = self.ann_tool_var.get()
-        if tool != "none":
+        # Robustesse : on se base sur l'état de dessin démarré au clic (self._draw_kind)
+        # plutôt que sur la valeur courante de ann_tool_var (qui peut changer entre temps).
+        if self._draw_kind in ("ink", "arrow", "textbox", "image"):
             if self._draw_page is None or int(page_index) != int(self._draw_page):
                 return
 
@@ -1630,10 +1802,8 @@ class AppWindow:
                     self._draw_points.append((float(x_pt), float(y_pt)))
                 return
 
-            if self._draw_kind in ("arrow", "textbox", "image"):
-                self._draw_end = (float(x_pt), float(y_pt))
-                return
-
+            # arrow/text/image : on met à jour l'endpoint au fil du drag
+            self._draw_end = (float(x_pt), float(y_pt))
             return
 
         # 3) pastilles: déplacement éventuel
@@ -1645,6 +1815,8 @@ class AppWindow:
             self._on_pdf_drag_for_correction(page_index, x_pt, y_pt)
 
     def _on_pdf_release(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        # fin interaction souris : important pour ne pas régénérer au milieu d'un clic
+        self._pdf_mouse_down = False
         # Fin d'un déplacement (mode sélection)
         if self._draw_kind == "move":
             moved = bool(getattr(self, "_move_has_moved", False))
@@ -1670,140 +1842,178 @@ class AppWindow:
                 except Exception:
                     pass
                 try:
-                    self.c_regenerate()
+                    self._schedule_regenerate()
                 except Exception:
                     pass
             self._reset_draw_state()
             return
 
-        tool = self.ann_tool_var.get()
-        if tool != "none":
-            if not self._require_doc():
-                self._reset_draw_state()
-                return
-
-            if self._draw_page is None or int(page_index) != int(self._draw_page):
-                self._reset_draw_state()
-                return
-
-            assert self.project is not None
-            doc = self.project.get_current_doc()
-            assert doc is not None
-
-            anns = self._annotations_for_current_doc()
-
-            if tool == "ink":
-                if len(self._draw_points) >= 2:
-                    ann = {
-                        "id": str(uuid.uuid4()),
-                        "kind": "ink",
-                        "page": int(page_index),
-                        "points": [[p[0], p[1]] for p in self._draw_points],
-                        "style": {
-                            "color": self._color_hex(self.ann_color_var.get(), "bleu"),
-                            "width_pt": float(self.ann_width_var.get()),
-                        },
-                        "payload": {},
-                    }
-                    anns.append(ann)
-                    self.project.save()
-                    self.c_regenerate()
-                self._reset_draw_state()
-                return
-
-            if tool == "arrow":
-                s = self._draw_start
-                e = self._draw_end or (float(x_pt), float(y_pt))
-                if s and e:
-                    ann = {
-                        "id": str(uuid.uuid4()),
-                        "kind": "arrow",
-                        "page": int(page_index),
-                        "start": [float(s[0]), float(s[1])],
-                        "end": [float(e[0]), float(e[1])],
-                        "style": {
-                            "color": self._color_hex(self.ann_color_var.get(), "bleu"),
-                            "width_pt": float(self.ann_width_var.get()),
-                        },
-                        "payload": {},
-                    }
-                    anns.append(ann)
-                    self.project.save()
-                    self.c_regenerate()
-                self._reset_draw_state()
-                return
-
-            if tool == "image":
-                s = self._draw_start
-                e = self._draw_end or (float(x_pt), float(y_pt))
-                if not s or not e:
-                    self._reset_draw_state()
+        kind = self._draw_kind
+        if kind in ("ink", "arrow", "textbox", "image"):
+            # Insertion d'annotations (robuste)
+            try:
+                if not self._require_doc():
+                    return
+                if self._draw_page is None:
                     return
 
-                # construit une annotation image via le module (gestion bibliothèque / ratio)
-                try:
-                    ann = self.image_tool.build_annotation(
-                        int(page_index),
-                        (float(s[0]), float(s[1])),
-                        (float(e[0]), float(e[1])),
-                        (float(x_pt), float(y_pt)),
-                    )
-                except Exception:
+                start_page = int(self._draw_page)
+                anns = self._annotations_for_current_doc()
+
+                if kind == "ink":
+                    if len(self._draw_points) >= 2:
+                        ann = {
+                            "id": str(uuid.uuid4()),
+                            "kind": "ink",
+                            "page": int(start_page),
+                            "points": [[p[0], p[1]] for p in self._draw_points],
+                            "style": {
+                                "color": self._color_hex(self.ann_color_var.get(), "bleu"),
+                                "width_pt": float(self.ann_width_var.get()),
+                            },
+                            "payload": {},
+                        }
+                        anns.append(ann)
+                        assert self.project is not None
+                        self.project.save()
+                        self._schedule_regenerate()
+                    return
+
+                if kind == "arrow":
+                    s = self._draw_start
+                    e = self._draw_end or (float(x_pt), float(y_pt))
+                    if s and e:
+                        ann = {
+                            "id": str(uuid.uuid4()),
+                            "kind": "arrow",
+                            "page": int(start_page),
+                            "start": [float(s[0]), float(s[1])],
+                            "end": [float(e[0]), float(e[1])],
+                            "style": {
+                                "color": self._color_hex(self.ann_color_var.get(), "bleu"),
+                                "width_pt": float(self.ann_width_var.get()),
+                            },
+                            "payload": {},
+                        }
+                        anns.append(ann)
+                        assert self.project is not None
+                        self.project.save()
+                        self._schedule_regenerate()
+                    return
+
+                if kind == "image":
+                    s = self._draw_start
+                    e = self._draw_end or (float(x_pt), float(y_pt))
+                    if not s or not e:
+                        return
+
+                    # construit une annotation image via le module (gestion bibliothèque / ratio)
                     ann = None
+                    try:
+                        ann = self.image_tool.build_annotation(
+                            int(start_page),
+                            (float(s[0]), float(s[1])),
+                            (float(e[0]), float(e[1])),
+                            (float(x_pt), float(y_pt)),
+                        )
+                    except Exception:
+                        ann = None
 
-                if not ann:
-                    messagebox.showwarning("Image", "Aucune image sélectionnée (ou bibliothèque vide).")
-                    self._reset_draw_state()
+                    if not ann:
+                        messagebox.showwarning("Image", "Aucune image sélectionnée (ou bibliothèque vide).")
+                        return
+
+                    anns.append(ann)
+                    assert self.project is not None
+                    self.project.save()
+                    self._schedule_regenerate()
                     return
 
-                anns.append(ann)
-                self.project.save()
-                self.c_regenerate()
-                self._reset_draw_state()
+                if kind == "textbox":
+                    s = self._draw_start
+                    e = self._draw_end or (float(x_pt), float(y_pt))
+                    if not s or not e:
+                        return
+
+                    x0, y0 = s
+                    x1, y1 = e
+
+                    # Multi-lignes: on lit depuis le champ (Options) ; si vide on ouvre un dialogue multi-lignes.
+                    text_val = (self._get_text_tool_content() or "").rstrip()
+                    if not text_val:
+                        text_val = MultiLineTextDialog.ask(
+                            self.root,
+                            title="Texte",
+                            prompt="Contenu de la zone de texte (multi-lignes) :",
+                            initial="",
+                        )
+                        text_val = (text_val or "").rstrip()
+                        if text_val:
+                            # pratique: garde le texte dans les options pour les insertions suivantes
+                            self._set_text_tool_content(text_val)
+
+                    if not text_val:
+                        return
+
+                    # --- Rect robuste ---
+                    # Si l'utilisateur ne dessine pas (clic simple), on calcule une hauteur suffisante
+                    # pour afficher toutes les lignes. Sinon, on respecte le rectangle dessiné.
+                    # IMPORTANT: beaucoup d'utilisateurs cliquent (sans drag) -> si la hauteur est fixe (40pt),
+                    # seules 1 ligne (voire 2) apparaissent, donnant l'impression que "seule la première ligne" est insérée.
+                    fontsize = float(self.text_size_var.get())
+                    padding = 4.0
+                    lines = text_val.splitlines() or [text_val]
+                    n_lines = max(1, len(lines))
+                    line_h = max(10.0, fontsize * 1.25)
+                    min_h_for_text = padding * 2 + n_lines * line_h + 2
+
+                    if abs(x1 - x0) < 6 or abs(y1 - y0) < 6:
+                        # largeur par défaut + hauteur adaptée au nombre de lignes
+                        x1 = x0 + 260
+                        y1 = y0 + max(44.0, float(min_h_for_text))
+                    else:
+                        # rectangle dessiné : si trop petit, on l'agrandit légèrement en hauteur
+                        if abs(y1 - y0) < min_h_for_text:
+                            y1 = y0 + float(min_h_for_text)
+
+                    rect = [float(x0), float(y0), float(x1), float(y1)]
+
+                    ann = {
+                        "id": str(uuid.uuid4()),
+                        "kind": "textbox",
+                        "page": int(start_page),
+                        "rect": rect,
+                        "text": text_val,
+                        "style": {
+                            "color": self._color_hex(self.text_color_var.get(), "bleu"),
+                            "fontsize": fontsize,
+                        },
+                        "payload": {},
+                    }
+                    anns.append(ann)
+                    assert self.project is not None
+                    self.project.save()
+                    self._schedule_regenerate()
+
+                    # Feedback visuel (utile si l'utilisateur pense que "rien ne se passe")
+                    try:
+                        if hasattr(self, "_click_hint"):
+                            self._click_hint.configure(text=f"Mode clic : ON • texte ajouté (p.{start_page+1})")
+                    except Exception:
+                        pass
+                    return
+
+                # outil inconnu
                 return
 
-            if tool == "textbox":
-                s = self._draw_start
-                e = self._draw_end or (float(x_pt), float(y_pt))
-                if not s or not e:
-                    self._reset_draw_state()
-                    return
-
-                x0, y0 = s
-                x1, y1 = e
-                # rect normalisé + taille minimale
-                if abs(x1 - x0) < 6 or abs(y1 - y0) < 6:
-                    x1 = x0 + 220
-                    y1 = y0 + 40
-                rect = [float(x0), float(y0), float(x1), float(y1)]
-
-                text = self.text_value_var.get().strip()
-                if not text:
-                    text = simpledialog.askstring("Texte", "Contenu de la zone de texte :", parent=self.root) or ""
-                    text = text.strip()
-                if not text:
-                    self._reset_draw_state()
-                    return
-
-                ann = {
-                    "id": str(uuid.uuid4()),
-                    "kind": "textbox",
-                    "page": int(page_index),
-                    "rect": rect,
-                    "text": text,
-                    "style": {
-                        "color": self._color_hex(self.text_color_var.get(), "bleu"),
-                        "fontsize": float(self.text_size_var.get()),
-                    },
-                    "payload": {},
-                }
-                anns.append(ann)
-                self.project.save()
-                self.c_regenerate()
+            except Exception as e:
+                # En version packagée, les exceptions Tk peuvent être silencieuses : on affiche un message clair.
+                try:
+                    messagebox.showerror("Annotation", f"Erreur insertion annotation ({kind}).\n\n{e}")
+                except Exception:
+                    pass
+            finally:
                 self._reset_draw_state()
-                return
-
-            self._reset_draw_state()
             return
 
         # pastilles: fin déplacement
@@ -3027,9 +3237,13 @@ class AppWindow:
         # Rafraîchissement robuste (important en version packagée .exe : les exceptions Tk peuvent être silencieuses)
         def _open_corrected_after_regen():
             try:
-                self.viewer.open_pdf(out_pdf, preserve_view=True)
+                self.viewer.open_pdf(out_pdf, preserve_view=True, lazy_render=True)
                 try:
                     self._update_margin_guide()
+                except Exception:
+                    pass
+                try:
+                    self._update_click_mode()
                 except Exception:
                     pass
             except TypeError:
@@ -3039,10 +3253,14 @@ class AppWindow:
                     self._update_margin_guide()
                 except Exception:
                     pass
+                try:
+                    self._update_click_mode()
+                except Exception:
+                    pass
             except Exception:
                 # dernier recours : retenter un peu plus tard (écriture fichier / cache OS)
                 try:
-                    self.root.after(80, lambda: self.viewer.open_pdf(out_pdf))
+                    self.root.after(80, lambda: self.viewer.open_pdf(out_pdf, preserve_view=True, lazy_render=True))
                 except Exception:
                     pass
         # Laisse Tk finir le callback (menu/context) avant de re-render le canvas
