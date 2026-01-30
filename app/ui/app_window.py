@@ -12,9 +12,12 @@ import sys
 
 from app.ui.theme import apply_dark_theme, DARK_BG, DARK_BG_2
 from app.core.project import Project
-from app.services.pdf_margin import add_left_margin
+from app.services.pdf_margin import add_margins, add_left_margin
 from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
+from app.services.pdf_recap_to_csv_table_fixed2 import collect_results as recap_collect_results, write_csv as recap_write_csv
+from app.ui.image_tool import ImageStampTool
+from app.ui.widgets.scrollable_frame import VScrollableFrame
 
 def _sanitize_tk_filetypes(filetypes):
     """Nettoie les filetypes pour éviter des crashs Tk sur macOS (NSOpenPanel/NSSavePanel).
@@ -80,6 +83,7 @@ def _sanitize_tk_filetypes(filetypes):
 
     return clean or None
 from app.ui.widgets.pdf_viewer import PDFViewer
+from app.ui.widgets.multiline_text_dialog import MultiLineTextDialog
 
 from app.core.grading import (
     ensure_scheme_dict, scheme_from_dict, scheme_to_dict,
@@ -89,7 +93,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.0.3"
+APP_VERSION = "0.7.5"
 
 
 class AppWindow:
@@ -110,8 +114,12 @@ class AppWindow:
         self.c_label_style_var = tk.StringVar(value="blue")
         self.c_label_style_var.trace_add("write", lambda *_: self._on_pastille_label_style_changed())
 
+        # Alignement dans la marge (Correction V0) : distance (cm) depuis le bord gauche
+        # (utilisé quand "Aligner dans la marge" est coché)
+        self.c_align_margin_cm_var = tk.StringVar(value="0.5")
+
         # Outils d'annotation classiques (Visualisation PDF)
-        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow
+        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow | image
         self.ann_color_var = tk.StringVar(value="bleu")  # couleur trait / flèche
         self.ann_width_var = tk.IntVar(value=3)          # épaisseur trait / flèche
 
@@ -119,11 +127,13 @@ class AppWindow:
         self.text_size_var = tk.IntVar(value=14)         # taille police
         self.text_value_var = tk.StringVar(value="")     # texte à placer (optionnel)
 
+
         # Sélection d'annotations (outil 'Sélection')
         self._selected_ann_ids: set[str] = set()
         self._sel_info_var = tk.StringVar(value="Sélection : 0")
-        self.sel_mode_var = tk.BooleanVar(value=True)
-        self.sel_mode_var.trace_add("write", lambda *_: self._update_click_mode())
+        self.sel_mode_var = tk.BooleanVar(value=False)
+        self.sel_mode_var.trace_add("write", lambda *_: self._on_sel_mode_changed())
+        self._sync_tool_sel_guard = False  # évite les boucles tool<->sélection
 
 
         # Etat runtime (drag)
@@ -133,6 +143,11 @@ class AppWindow:
         self._draw_start: tuple[float, float] | None = None
         self._draw_end: tuple[float, float] | None = None
 
+        # Robustesse : empêche une régénération PDF (open_pdf) de tomber au milieu
+        # d'une interaction souris (clic-glisser / relâchement). Sinon, on peut
+        # perdre l'événement <ButtonRelease> et l'insertion suivante "ne fait rien".
+        self._pdf_mouse_down: bool = False
+
         # Déplacement d'annotations (outil "Déplacer")
         self._move_active: bool = False
         self._move_ann_id: str | None = None
@@ -140,7 +155,11 @@ class AppWindow:
         self._move_snapshot: dict | None = None
         self._move_has_moved: bool = False
 
+        # Régénération PDF (debounce) : évite de régénérer trop souvent et améliore la robustesse
+        self._regen_after_id = None
 
+        # Outil "Image (PNG)" : géré dans un module séparé pour ne pas alourdir app_window.py
+        self.image_tool = ImageStampTool(self)
         # --- Barre haute ---
         top = ttk.Frame(root)
         top.pack(fill="x", padx=10, pady=10)
@@ -161,46 +180,237 @@ class AppWindow:
         self.tab_view = ttk.Frame(self.nb)
         self.tab_export = ttk.Frame(self.nb)
         self.tab_grading = ttk.Frame(self.nb)
+        self.tab_synth_note = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_project, text="Import / Projet")
         self.nb.add(self.tab_view, text="Visualisation PDF")
         self.nb.add(self.tab_export, text="Export verrouillé")
         self.nb.add(self.tab_grading, text="Notation")
+        self.nb.add(self.tab_synth_note, text="Synthese Note")
 
         self._build_tab_project()
         self._build_tab_view()
         self._build_tab_export()
         self._build_tab_grading()
+        self._build_tab_synthese_note()
 
         self.nb.bind("<<NotebookTabChanged>>", self._update_click_mode)
         # Rafraîchit le mode de clic quand l'outil change
-        self.ann_tool_var.trace_add("write", lambda *_: (self._sync_tool_combo_from_var(), self._update_annot_toolbar_state(), self._update_click_mode()))
+        self.ann_tool_var.trace_add("write", lambda *_: self._on_annot_tool_changed())
         self.ann_color_var.trace_add("write", lambda *_: self._update_click_mode())
 
         # Molette souris / trackpad : route le scroll vers la zone sous le curseur (PDF à droite ou panneau Correction V0 à gauche)
         self.root.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._on_global_mousewheel_linux, add="+")
         self.root.bind_all("<Button-5>", self._on_global_mousewheel_linux, add="+")
+        # Raccourci ergonomique : masquer/afficher le panneau de gauche (Correction/Infos) pour agrandir la vue PDF
+        self.root.bind("<F8>", lambda _e: self._toggle_view_left_pane(), add="+")
 
     # ---------------- UI : Import/Projet ----------------
     def _build_tab_project(self) -> None:
         frm = ttk.Frame(self.tab_project)
         frm.pack(fill="both", expand=True, padx=12, pady=12)
 
-        ttk.Label(frm, text="Importer des copies (PDF) : marge 5 cm à gauche appliquée automatiquement.").pack(anchor="w")
+        ttk.Label(frm, text="Importer des copies (PDF) : avant l'import, vous pouvez ajouter une marge (0 / 2,5 / 5 cm) à gauche, à droite ou des deux côtés.").pack(anchor="w")
         ttk.Button(frm, text="Importer PDF(s)…", command=self.import_pdfs).pack(anchor="w", pady=(10, 10))
 
         ttk.Label(frm, text="Documents du projet :").pack(anchor="w", pady=(6, 4))
+        list_wrap = ttk.Frame(frm)
+        list_wrap.pack(fill="both", expand=False, pady=(0, 8))
         self.files_list = tk.Listbox(
-            frm, height=18, bg=DARK_BG_2, fg="white",
+            list_wrap, height=18, bg=DARK_BG_2, fg="white",
             highlightthickness=0, selectbackground="#2F81F7"
         )
-        self.files_list.pack(fill="x", pady=(0, 8))
+        files_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=self.files_list.yview)
+        self.files_list.configure(yscrollcommand=files_scroll.set)
+        self.files_list.pack(side="left", fill="both", expand=True)
+        files_scroll.pack(side="right", fill="y")
         self.files_list.bind("<<ListboxSelect>>", self.on_select_file)
 
         ttk.Label(frm, text="Astuce : Visualisation PDF > Correction V0 → clique dans le PDF pour poser les pastilles.").pack(anchor="w", pady=(10, 0))
 
     # ---------------- UI : Visualisation + sous-onglets ----------------
+    
+
+    def _get_project_margins_lr(self) -> tuple[float, float]:
+        """Retourne (marge_gauche_cm, marge_droite_cm) depuis les settings (compat inclus)."""
+        if not self.project:
+            return 5.0, 0.0
+        s = self.project.settings or {}
+
+        def _f(key: str, default: float = 0.0) -> float:
+            try:
+                return float(s.get(key, default) or 0.0)
+            except Exception:
+                return float(default)
+
+        left = _f("margin_left_cm", _f("left_margin_cm", 5.0))
+        right = _f("margin_right_cm", 0.0)
+
+        if left < 0:
+            left = 0.0
+        if right < 0:
+            right = 0.0
+        return left, right
+
+    def _get_import_margin_choice_default(self) -> tuple[float, str]:
+        """Retourne (largeur_cm, position) pour le dialogue d'import (position: left/right/both)."""
+        if not self.project:
+            return 5.0, "left"
+        s = self.project.settings or {}
+
+        # Si on a déjà mémorisé le choix explicite
+        w = s.get("import_margin_width_cm", None)
+        pos = s.get("import_margin_position", None)
+        if w is not None and pos:
+            try:
+                return float(w), str(pos)
+            except Exception:
+                pass
+
+        left, right = self._get_project_margins_lr()
+        if left <= 0.0001 and right <= 0.0001:
+            return 0.0, "left"
+        if left > 0.0 and right <= 0.0:
+            return float(left), "left"
+        if right > 0.0 and left <= 0.0:
+            return float(right), "right"
+        if abs(left - right) < 1e-6:
+            return float(left), "both"
+        return float(max(left, right)), "both"
+
+    def _apply_import_margin_choice_to_settings(self, width_cm: float, position: str) -> tuple[float, float]:
+        """Applique le choix (0/2.5/5 + position) au projet et renvoie (left_cm, right_cm)."""
+        if not self.project:
+            return 0.0, 0.0
+
+        width = float(width_cm or 0.0)
+        pos = (position or "left").strip().lower()
+
+        if width <= 0.0:
+            left = right = 0.0
+            pos = "left"
+        elif pos in ("left", "gauche", "l"):
+            left, right = width, 0.0
+            pos = "left"
+        elif pos in ("right", "droite", "r"):
+            left, right = 0.0, width
+            pos = "right"
+        else:
+            left, right = width, width
+            pos = "both"
+
+        # Settings canoniques (nouveau)
+        self.project.settings["margin_left_cm"] = float(left)
+        self.project.settings["margin_right_cm"] = float(right)
+
+        # Compat (ancien)
+        self.project.settings["left_margin_cm"] = float(left)
+
+        # Pour pré-remplir le dialogue la prochaine fois
+        self.project.settings["import_margin_width_cm"] = float(width)
+        self.project.settings["import_margin_position"] = pos
+
+        return float(left), float(right)
+
+    def _ask_import_margin_options(self, default_width_cm: float, default_position: str) -> tuple[float, str] | None:
+        """Dialogue modal : retourne (largeur_cm, position) ou None si annulé."""
+        top = tk.Toplevel(self.root)
+        top.title("Options de marge (import PDF)")
+        try:
+            top.transient(self.root)
+            top.grab_set()
+            top.resizable(False, False)
+        except Exception:
+            pass
+
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Choisis la marge à ajouter aux pages importées :").pack(anchor="w")
+
+        w_var = tk.StringVar(value=str(float(default_width_cm)))
+        pos_var = tk.StringVar(value=str(default_position or "left"))
+
+        lf_w = ttk.LabelFrame(frm, text="Largeur de marge")
+        lf_w.pack(fill="x", pady=(8, 6))
+
+        # Valeurs imposées par le besoin (0 / 2,5 / 5)
+        for val, lab in (
+            (0.0, "0 cm (pas de marge)"),
+            (2.5, "2,5 cm"),
+            (5.0, "5 cm"),
+        ):
+            ttk.Radiobutton(lf_w, text=lab, variable=w_var, value=str(val)).pack(anchor="w", padx=8, pady=2)
+
+        lf_pos = ttk.LabelFrame(frm, text="Position")
+        lf_pos.pack(fill="x", pady=(6, 6))
+
+        rb_left = ttk.Radiobutton(lf_pos, text="Gauche", variable=pos_var, value="left")
+        rb_right = ttk.Radiobutton(lf_pos, text="Droite", variable=pos_var, value="right")
+        rb_both = ttk.Radiobutton(lf_pos, text="Les 2 côtés", variable=pos_var, value="both")
+
+        for rb in (rb_left, rb_right, rb_both):
+            rb.pack(anchor="w", padx=8, pady=2)
+
+        def _sync_side_state(*_args) -> None:
+            try:
+                w = float(str(w_var.get()).replace(",", "."))
+            except Exception:
+                w = 5.0
+            state = "disabled" if w <= 0.0 else "normal"
+            try:
+                for rb in (rb_left, rb_right, rb_both):
+                    rb.configure(state=state)
+            except Exception:
+                pass
+
+        w_var.trace_add("write", _sync_side_state)
+        _sync_side_state()
+
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        result = {"ok": False}
+
+        def _ok() -> None:
+            result["ok"] = True
+            top.destroy()
+
+        def _cancel() -> None:
+            top.destroy()
+
+        ttk.Button(btn_row, text="Annuler", command=_cancel).pack(side="right")
+        ttk.Button(btn_row, text="OK", command=_ok).pack(side="right", padx=(0, 6))
+
+        top.bind("<Escape>", lambda _e: _cancel())
+        top.bind("<Return>", lambda _e: _ok())
+
+        # Centre la fenêtre
+        try:
+            top.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (top.winfo_width() // 2)
+            y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (top.winfo_height() // 2)
+            top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        self.root.wait_window(top)
+
+        if not result["ok"]:
+            return None
+
+        try:
+            width = float(str(w_var.get()).replace(",", "."))
+        except Exception:
+            width = 5.0
+        pos = str(pos_var.get() or "left").strip().lower()
+        if width <= 0.0:
+            pos = "left"
+        if pos not in ("left", "right", "both"):
+            pos = "left"
+        return float(width), pos
+
     def _build_tab_view(self) -> None:
         container = ttk.Frame(self.tab_view)
         container.pack(fill="both", expand=True)
@@ -233,6 +443,48 @@ class AppWindow:
 
         self._click_hint = ttk.Label(self.view_left, text="Mode clic : OFF")
         self._click_hint.pack(anchor="w", padx=10, pady=(6, 6))
+
+
+    def _toggle_view_left_pane(self) -> None:
+        """Masque/affiche le panneau de gauche (Correction/Infos) pour agrandir la vue PDF.
+
+        Raccourci : F8
+        """
+        pane = getattr(self, "view_pane", None)
+        left = getattr(self, "view_left", None)
+        if pane is None or left is None:
+            return
+
+        hidden = bool(getattr(self, "_view_left_hidden", False))
+
+        if not hidden:
+            # Mémorise (si possible) la position du séparateur
+            try:
+                self._view_left_prev_sash = pane.sashpos(0)
+            except Exception:
+                self._view_left_prev_sash = None
+            try:
+                pane.forget(left)
+            except Exception:
+                return
+            self._view_left_hidden = True
+        else:
+            # Réinsère à gauche
+            try:
+                pane.insert(0, left, weight=0)
+            except Exception:
+                try:
+                    pane.add(left, weight=0)
+                except Exception:
+                    return
+            # Restaure la position du séparateur si dispo
+            try:
+                pos = getattr(self, "_view_left_prev_sash", None)
+                if pos is not None and hasattr(pane, "sashpos"):
+                    pane.sashpos(0, pos)
+            except Exception:
+                pass
+            self._view_left_hidden = False
     def _build_view_correction_panel(self) -> None:
         # Zone scrollable : indispensable quand la fenêtre est petite (sinon les boutons du bas disparaissent)
         outer = ttk.Frame(self.sub_correction)
@@ -276,7 +528,36 @@ class AppWindow:
         ttk.Label(frm, textvariable=self.c_total_var).pack(anchor="w", pady=(0, 8))
 
         self.c_move_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 10))
+        ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 4))
+
+        if not hasattr(self, 'c_align_margin_var'):
+            self.c_align_margin_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Aligner dans la marge", variable=self.c_align_margin_var).pack(anchor="w", pady=(0, 4))
+
+        # Distance d'alignement (cm) : position X verrouillée depuis le bord gauche
+        if not hasattr(self, 'c_align_margin_cm_var'):
+            self.c_align_margin_cm_var = tk.StringVar(value="0.5")
+        margin_row = ttk.Frame(frm)
+        margin_row.pack(anchor="w", pady=(0, 10))
+        ttk.Label(margin_row, text="Distance marge (cm) :").pack(side="left")
+        try:
+            spin = ttk.Spinbox(margin_row, from_=0.0, to=10.0, increment=0.1, width=6, textvariable=self.c_align_margin_cm_var, command=self._apply_corr_margin_cm)
+        except Exception:
+            spin = tk.Spinbox(margin_row, from_=0.0, to=10.0, increment=0.1, width=6, textvariable=self.c_align_margin_cm_var, command=self._apply_corr_margin_cm)
+        spin.pack(side="left", padx=(6, 0))
+        try:
+            spin.bind("<Return>", self._apply_corr_margin_cm)
+            spin.bind("<FocusOut>", self._apply_corr_margin_cm)
+        except Exception:
+            pass
+        ttk.Label(margin_row, text="ex: 0,5").pack(side="left", padx=(8, 0))
+
+        # Affiche/masque la ligne guide d'alignement dans la marge
+        try:
+            self.c_align_margin_var.trace_add("write", lambda *_: self._update_margin_guide())
+        except Exception:
+            pass
+
         ttk.Label(frm, text="Style du libellé :").pack(anchor="w")
         style_row = ttk.Frame(frm)
         style_row.pack(anchor="w", pady=(2, 4))
@@ -308,7 +589,7 @@ class AppWindow:
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Supprimer sélection", command=self.c_delete_selected).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Supprimer sélection", command=(lambda: self.c_delete_selected() if hasattr(self, "c_delete_selected") else self.ann_delete_selected())).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="Supprimer dernière", command=self.c_delete_last).pack(side="left")
 
         ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(10, 8))
@@ -487,13 +768,259 @@ class AppWindow:
         self.refresh_grading_tree()
 
     # ---------------- Click mode (Correction V0) ----------------
-    def _update_click_mode(self, _evt=None) -> None:
-        main = self.nb.tab(self.nb.select(), "text")
-        sub = ""
+
+    def _build_tab_synthese_note(self) -> None:
+        """Onglet: extrait le bloc RÉCAPITULATIF des PDF verrouillés et construit un tableau + CSV."""
+        # Conteneur scrollable (pour voir les boutons en bas même sur petits écrans)
+        outer = ttk.Frame(self.tab_synth_note)
+        outer.pack(fill="both", expand=True)
+
+        self.sn_canvas = tk.Canvas(outer, highlightthickness=0)
+        self.sn_vsb = ttk.Scrollbar(outer, orient="vertical", command=self.sn_canvas.yview)
+        self.sn_canvas.configure(yscrollcommand=self.sn_vsb.set)
+
+        self.sn_vsb.pack(side="right", fill="y")
+        self.sn_canvas.pack(side="left", fill="both", expand=True)
+
+        frm = ttk.Frame(self.sn_canvas, padding=(12, 12))
+        win_id = self.sn_canvas.create_window((0, 0), window=frm, anchor="nw")
+
+        def _sn_on_frame_configure(_event=None):
+            # Met à jour la zone scrollable
+            self.sn_canvas.configure(scrollregion=self.sn_canvas.bbox("all"))
+
+        def _sn_on_canvas_configure(event):
+            # Garde la largeur du contenu alignée sur la largeur visible
+            try:
+                self.sn_canvas.itemconfigure(win_id, width=event.width)
+            except Exception:
+                pass
+
+        frm.bind("<Configure>", _sn_on_frame_configure)
+        self.sn_canvas.bind("<Configure>", _sn_on_canvas_configure)
+
+        # Etat
+        self.sn_pdf_paths: list[Path] = []
+        self.sn_sel_info = tk.StringVar(value="Aucun fichier sélectionné.")
+        default_out = str(Path.home() / "notes_recapitulatif.csv")
         try:
-            sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+            if self.project is not None:
+                default_out = str((self.project.root_dir / "exports" / "notes_recapitulatif.csv").resolve())
         except Exception:
-            sub = ""
+            pass
+        self.sn_out_var = tk.StringVar(value=default_out)
+
+        # --- 1) Sélection ---
+        sel_box = ttk.LabelFrame(frm, text="1) Sélection des PDF", padding=10)
+        sel_box.pack(fill="x")
+
+        btns = ttk.Frame(sel_box)
+        btns.pack(fill="x")
+
+        def _refresh_sel_label():
+            if not self.sn_pdf_paths:
+                self.sn_sel_info.set("Aucun fichier sélectionné.")
+            else:
+                self.sn_sel_info.set(f"{len(self.sn_pdf_paths)} PDF sélectionné(s).")
+
+        def _refresh_listbox():
+            lb.delete(0, "end")
+            for p in self.sn_pdf_paths:
+                lb.insert("end", str(p))
+            _refresh_sel_label()
+
+        def choose_folder():
+            folder = filedialog.askdirectory(title="Choisir un dossier contenant des PDF")
+            if not folder:
+                return
+            folder_path = Path(folder)
+            self.sn_pdf_paths = sorted(folder_path.glob("*.pdf"))
+            _refresh_listbox()
+
+        def choose_files():
+            files = filedialog.askopenfilenames(
+                title="Choisir des fichiers PDF",
+                filetypes=_sanitize_tk_filetypes([("PDF", "*.pdf")]),
+            )
+            if not files:
+                return
+            self.sn_pdf_paths = [Path(p) for p in files]
+            _refresh_listbox()
+
+        def remove_selected():
+            sel = list(lb.curselection())
+            if not sel:
+                return
+            keep = []
+            for i, p in enumerate(self.sn_pdf_paths):
+                if i not in sel:
+                    keep.append(p)
+            self.sn_pdf_paths = keep
+            _refresh_listbox()
+
+        def clear_list():
+            self.sn_pdf_paths = []
+            _refresh_listbox()
+
+        ttk.Button(btns, text="Choisir un dossier…", command=choose_folder).pack(side="left")
+        ttk.Button(btns, text="Choisir des PDF…", command=choose_files).pack(side="left", padx=8)
+        ttk.Button(btns, text="Retirer la sélection", command=remove_selected).pack(side="left", padx=8)
+        ttk.Button(btns, text="Vider", command=clear_list).pack(side="left")
+
+        ttk.Label(sel_box, textvariable=self.sn_sel_info).pack(anchor="w", pady=(8, 0))
+
+        # Listbox + scrollbar
+        list_row = ttk.Frame(sel_box)
+        list_row.pack(fill="both", expand=False, pady=(8, 0))
+        lb = tk.Listbox(list_row, height=6, selectmode="extended")
+        lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_row, orient="vertical", command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.configure(yscrollcommand=sb.set)
+
+        # --- 2) Sortie CSV ---
+        out_box = ttk.LabelFrame(frm, text="2) Fichier de sortie CSV", padding=10)
+        out_box.pack(fill="x", pady=10)
+
+        out_row = ttk.Frame(out_box)
+        out_row.pack(fill="x")
+        out_entry = ttk.Entry(out_row, textvariable=self.sn_out_var)
+        out_entry.pack(side="left", fill="x", expand=True)
+
+        def choose_output():
+            p = filedialog.asksaveasfilename(
+                title="Enregistrer le CSV",
+                defaultextension=".csv",
+                filetypes=_sanitize_tk_filetypes([("CSV", "*.csv")]),
+                initialfile=Path(self.sn_out_var.get()).name if self.sn_out_var.get() else "notes_recapitulatif.csv",
+            )
+            if p:
+                self.sn_out_var.set(p)
+
+        def use_project_exports():
+            if self.project is None:
+                messagebox.showwarning("Projet", "Aucun projet ouvert.")
+                return
+            exports_dir = (self.project.root_dir / "exports").resolve()
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            self.sn_out_var.set(str((exports_dir / "notes_recapitulatif.csv").resolve()))
+
+        ttk.Button(out_row, text="Choisir…", command=choose_output).pack(side="left", padx=8)
+        ttk.Button(out_row, text="Utiliser exports du projet", command=use_project_exports).pack(side="left")
+
+        # --- 3) Actions ---
+        act_box = ttk.LabelFrame(frm, text="3) Génération", padding=10)
+        act_box.pack(fill="x")
+
+        ttk.Button(act_box, text="Générer (CSV + tableau)", command=lambda: generate()).pack(anchor="w")
+
+        # --- 4) Tableau (Treeview) ---
+        table_box = ttk.LabelFrame(frm, text="Résultats", padding=10)
+        table_box.pack(fill="both", expand=True, pady=(10, 0))
+
+        table_container = ttk.Frame(table_box)
+        table_container.pack(fill="both", expand=True)
+
+        self.sn_tree = ttk.Treeview(table_container, columns=("NOM PRENOM", "Total"), show="headings")
+        vsb = ttk.Scrollbar(table_container, orient="vertical", command=self.sn_tree.yview)
+        hsb = ttk.Scrollbar(table_container, orient="horizontal", command=self.sn_tree.xview)
+        self.sn_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.sn_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        table_container.rowconfigure(0, weight=1)
+        table_container.columnconfigure(0, weight=1)
+
+        def _setup_columns(columns: list[str]):
+            self.sn_tree["columns"] = columns
+            for col in columns:
+                self.sn_tree.heading(col, text=col)
+                w = 260 if col == "NOM PRENOM" else 90
+                self.sn_tree.column(col, width=w, minwidth=70, stretch=True, anchor="center")
+
+        def _fill_rows(results, columns, baremes=None):
+            for iid in self.sn_tree.get_children(""):
+                self.sn_tree.delete(iid)
+
+            # Ligne barème en premier (si fournie)
+            if baremes:
+                row_bm = {"NOM PRENOM": "BAREME"}
+                for c in columns:
+                    if c != "NOM PRENOM":
+                        row_bm[c] = baremes.get(c, "")
+                values = [row_bm.get(c, "") for c in columns]
+                self.sn_tree.insert("", "end", values=values)
+
+            for r in results:
+                row = {"NOM PRENOM": r.name}
+                row.update(r.scores)
+                values = [row.get(c, "") for c in columns]
+                self.sn_tree.insert("", "end", values=values)
+
+        def copy_all():
+            cols = list(self.sn_tree["columns"])
+            lines = ["\t".join(cols)]
+            for iid in self.sn_tree.get_children(""):
+                vals = self.sn_tree.item(iid, "values")
+                lines.append("\t".join(str(v) for v in vals))
+            txt_clip = "\n".join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt_clip)
+            self.root.update()
+
+        btn_row = ttk.Frame(table_box)
+        btn_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="Copier le tableau (TSV)", command=copy_all).pack(side="left")
+        ttk.Label(btn_row, text="(Coller directement dans Excel / Sheets)").pack(side="left", padx=10)
+
+        def generate():
+            if not self.sn_pdf_paths:
+                messagebox.showwarning("Synthèse", "Veuillez sélectionner un dossier ou des PDF.")
+                return
+            out_path = Path(self.sn_out_var.get()).expanduser()
+            try:
+                baremes = None
+
+                # Compat: ancienne version (2 retours) / nouvelle version (3 retours: +baremes)
+                try:
+                    results, columns, baremes = recap_collect_results(self.sn_pdf_paths)
+                except ValueError:
+                    results, columns = recap_collect_results(self.sn_pdf_paths)
+
+                # Compat: write_csv(out, results, cols) ou write_csv(out, results, cols, baremes)
+                try:
+                    recap_write_csv(out_path, results, columns, baremes)
+                except TypeError:
+                    recap_write_csv(out_path, results, columns)
+
+                _setup_columns(columns)
+                _fill_rows(results, columns, baremes)
+                messagebox.showinfo("Synthèse", f"CSV généré :\\n{out_path}")
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e))
+
+        # Init
+        _refresh_listbox()
+        _setup_columns(["NOM PRENOM", "Total"])
+
+    def _update_click_mode(self, _evt=None) -> None:
+        # IMPORTANT: ne pas baser la logique sur le texte des onglets (fragile si renommage).
+        # On compare directement les ids Tk des widgets.
+        main_sel = ""
+        try:
+            main_sel = str(self.nb.select())
+        except Exception:
+            main_sel = ""
+
+        sub_sel = ""
+        try:
+            sub_sel = str(self.view_subtabs.select())
+        except Exception:
+            sub_sel = ""
+
+        in_view_tab = (main_sel == str(self.tab_view))
+        in_correction_subtab = (sub_sel == str(getattr(self, "sub_correction", "")))
 
         tool = self.ann_tool_var.get() if hasattr(self, "ann_tool_var") else "none"
         sel_on = False
@@ -502,7 +1029,9 @@ class AppWindow:
         except Exception:
             sel_on = False
 
-        enabled = (main == "Visualisation PDF") and ((sub == "Correction V0") or (tool != "none") or sel_on)
+        # Robustesse: tant qu'on est dans l'onglet de visualisation, on laisse les callbacks actifs.
+        # Le handler décidera ensuite quoi faire (pastilles / outil / sélection).
+        enabled = bool(in_view_tab)
 
         self.viewer.set_interaction_callbacks(
             click_cb=self._on_pdf_click if enabled else None,
@@ -514,7 +1043,7 @@ class AppWindow:
         if hasattr(self, "_click_hint"):
             label = "OFF"
             if enabled:
-                if sub == "Correction V0":
+                if in_correction_subtab:
                     label = "ON • pastilles"
                 else:
                     sel = False
@@ -533,45 +1062,68 @@ class AppWindow:
             self._click_hint.configure(text=f"Mode clic : {label}")
 
 
+        # Met à jour l'affichage de la ligne guide (si activée)
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
+
 
     # ---------------- Outils PDF (annotation) ----------------
     def _build_pdf_toolbar(self, parent: ttk.Frame) -> None:
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x", padx=10, pady=(10, 0))
+        """Barre d'outils plus ergonomique pour maximiser la zone de visualisation.
 
-        ttk.Label(bar, text="Outils :").pack(side="left")
+        Toujours visibles (comme demandé) :
+        - Zoom (- / 100% / +)
+        - Outil "Sélection"
+        - Combobox des outils
+        - Boutons "Supprimer sélection" et "Désélectionner"
+
+        Les réglages détaillés (couleur/épaisseur/texte/images, etc.) sont déplacés
+        dans un panneau "Options" repliable.
+        """
+
+        # --- Ligne 1 (compacte) : choix d'outil ---
+        bar1 = ttk.Frame(parent)
+        bar1.pack(fill="x", padx=10, pady=(10, 0))
+
+        ttk.Label(bar1, text="Outils :").pack(side="left")
 
         # Mode sélection (permet de sélectionner + déplacer par glisser-déposer)
         self._sel_toggle = ttk.Checkbutton(
-            bar,
+            bar1,
             text="Sélection",
             variable=self.sel_mode_var,
             command=self._on_sel_toggle,
         )
         self._sel_toggle.pack(side="left", padx=(8, 8))
 
-        # Combobox (plus robuste que des boutons côte-à-côte : évite que des outils soient cachés
-        # quand la fenêtre est étroite ou en HiDPI)
+        # Combobox d'outils (robuste en HiDPI)
         self._tool_map = [
             ("Aucun", "none"),
             ("Main levée", "ink"),
             ("Texte", "textbox"),
             ("Flèche", "arrow"),
+            ("Image (PNG)", "image"),
         ]
         self._tool_label_var = tk.StringVar(value="Aucun")
         self._tool_combo = ttk.Combobox(
-            bar,
+            bar1,
             state="readonly",
             width=14,
             values=[t for t, _v in self._tool_map],
             textvariable=self._tool_label_var,
         )
-        self._tool_combo.pack(side="left", padx=(8, 0))
+        self._tool_combo.pack(side="left", padx=(0, 10))
         self._tool_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_tool_combo())
         self._sync_tool_combo_from_var()
 
+        # Bouton Options (repliable)
+        self._pdf_opts_open_var = tk.BooleanVar(value=False)
+        self._btn_pdf_opts = ttk.Button(bar1, text="Options ▸", command=self._toggle_pdf_options)
+        self._btn_pdf_opts.pack(side="left")
 
-        # Ligne 2 : sélection / suppression (évite que des boutons soient cachés en HiDPI)
+        # --- Ligne 2 (compacte) : sélection + zoom ---
         bar2 = ttk.Frame(parent)
         bar2.pack(fill="x", padx=10, pady=(6, 0))
 
@@ -581,15 +1133,32 @@ class AppWindow:
         self._btn_clear_sel = ttk.Button(bar2, text="Désélectionner", command=self.ann_clear_selection)
         self._btn_clear_sel.pack(side="left")
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=(6, 6))
+        # Zoom (à droite)
+        zoom_box = ttk.Frame(bar2)
+        zoom_box.pack(side="right")
+        ttk.Button(zoom_box, text="Zoom -", width=8, command=lambda: self._viewer_zoom(-1)).pack(side="left", padx=(0, 4))
+        ttk.Button(zoom_box, text="100%", width=6, command=self._viewer_zoom_reset).pack(side="left", padx=(0, 4))
+        ttk.Button(zoom_box, text="Zoom +", width=8, command=lambda: self._viewer_zoom(+1)).pack(side="left")
 
-        row = ttk.Frame(parent)
-        row.pack(fill="x", padx=10, pady=(0, 6))
+        # Séparateur fin (compact)
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=(6, 4))
 
-        # Couleur trait / flèche
-        ttk.Label(row, text="Couleur :").pack(side="left")
+        # --- Panneau Options (repliable) ---
+        # NOTE : on ne le pack PAS ici (caché par défaut)
+        # Panneau scrollable pour ne pas écraser la zone PDF quand les options sont longues
+        self._pdf_opts_container = VScrollableFrame(parent, height=200)
+        self._pdf_opts_inner = self._pdf_opts_container.inner
+
+        ttk.Label(self._pdf_opts_inner, text="Options de l'outil sélectionné :").pack(anchor="w", padx=10, pady=(0, 4))
+
+        # 1) Options trait/flèche
+        self._opts_ink_arrow = ttk.Frame(self._pdf_opts_inner)
+        row_ia = ttk.Frame(self._opts_ink_arrow)
+        row_ia.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(row_ia, text="Couleur :").pack(side="left")
         self._ann_color_combo = ttk.Combobox(
-            row,
+            row_ia,
             width=10,
             state="readonly",
             values=["rouge", "bleu", "vert", "violet", "marron", "noir"],
@@ -597,19 +1166,37 @@ class AppWindow:
         )
         self._ann_color_combo.pack(side="left", padx=(6, 12))
 
-        # Épaisseur
-        ttk.Label(row, text="Épaisseur :").pack(side="left")
-        self._ann_width_spin = ttk.Spinbox(row, from_=1, to=20, width=5, textvariable=self.ann_width_var)
-        self._ann_width_spin.pack(side="left", padx=(6, 12))
+        ttk.Label(row_ia, text="Épaisseur :").pack(side="left")
+        self._ann_width_spin = ttk.Spinbox(row_ia, from_=1, to=20, width=5, textvariable=self.ann_width_var)
+        self._ann_width_spin.pack(side="left", padx=(6, 0))
 
-        # Texte
-        ttk.Label(row, text="Texte :").pack(side="left")
-        self._ann_text_entry = ttk.Entry(row, textvariable=self.text_value_var, width=22)
-        self._ann_text_entry.pack(side="left", padx=(6, 12))
+        # 2) Options texte (multi-lignes)
+        self._opts_text = ttk.Frame(self._pdf_opts_inner)
 
-        ttk.Label(row, text="Police :").pack(side="left")
+        ttk.Label(self._opts_text, text="Texte :").pack(anchor="w", padx=10)
+        box_tx = ttk.Frame(self._opts_text)
+        box_tx.pack(fill="x", padx=10, pady=(0, 6))
+
+        self._ann_text_widget = tk.Text(box_tx, height=4, wrap="word")
+        self._ann_text_widget.pack(side="left", fill="x", expand=True)
+        sb_tx = ttk.Scrollbar(box_tx, orient="vertical", command=self._ann_text_widget.yview)
+        sb_tx.pack(side="right", fill="y")
+        self._ann_text_widget.configure(yscrollcommand=sb_tx.set)
+
+        # on initialise depuis la var (compat)
+        try:
+            init_txt = self.text_value_var.get() or ""
+            if init_txt:
+                self._ann_text_widget.insert("1.0", init_txt)
+        except Exception:
+            pass
+
+        row_tx2 = ttk.Frame(self._opts_text)
+        row_tx2.pack(fill="x", padx=10, pady=(0, 6))
+
+        ttk.Label(row_tx2, text="Couleur :").pack(side="left")
         self._text_color_combo = ttk.Combobox(
-            row,
+            row_tx2,
             width=10,
             state="readonly",
             values=["rouge", "bleu", "vert", "violet", "marron", "noir"],
@@ -617,12 +1204,188 @@ class AppWindow:
         )
         self._text_color_combo.pack(side="left", padx=(6, 8))
 
-        self._text_size_spin = ttk.Spinbox(row, from_=8, to=72, width=5, textvariable=self.text_size_var)
+        ttk.Label(row_tx2, text="Taille :").pack(side="left")
+        self._text_size_spin = ttk.Spinbox(row_tx2, from_=8, to=72, width=5, textvariable=self.text_size_var)
         self._text_size_spin.pack(side="left", padx=(6, 0))
 
+        # 3) Options images (PNG)
+        self._opts_image = ttk.Frame(self._pdf_opts_inner)
+        try:
+            self.image_tool.build_ui(self._opts_image)
+        except Exception:
+            pass
+
+        # état initial
         self._update_annot_toolbar_state()
 
+    def _toggle_pdf_options(self) -> None:
+        """Affiche/masque le panneau Options (repliable) pour gagner de la place."""
+        var = getattr(self, "_pdf_opts_open_var", None)
+        if var is None:
+            return
+        try:
+            visible = not bool(var.get())
+            var.set(visible)
+        except Exception:
+            visible = True
+        self._set_pdf_options_visible(visible)
 
+    def _set_pdf_options_visible(self, visible: bool) -> None:
+        cont = getattr(self, "_pdf_opts_container", None)
+        if cont is None:
+            return
+        try:
+            if visible:
+                cont.pack(fill="x", padx=0, pady=(0, 4))
+            else:
+                cont.pack_forget()
+        except Exception:
+            pass
+
+        btn = getattr(self, "_btn_pdf_opts", None)
+        if btn is not None:
+            try:
+                btn.configure(text=("Options ▾" if visible else "Options ▸"))
+            except Exception:
+                pass
+
+        # met à jour les frames visibles selon l'outil courant
+        try:
+            self._update_annot_toolbar_state()
+        except Exception:
+            pass
+
+    def _show_pdf_tool_options(self, tool: str) -> None:
+        """Affiche uniquement les options pertinentes pour l'outil courant."""
+        var = getattr(self, "_pdf_opts_open_var", None)
+        if var is None:
+            return
+        try:
+            if not bool(var.get()):
+                return
+        except Exception:
+            return
+
+        frames = [
+            getattr(self, "_opts_ink_arrow", None),
+            getattr(self, "_opts_text", None),
+            getattr(self, "_opts_image", None),
+        ]
+        for fr in frames:
+            if fr is None:
+                continue
+            try:
+                fr.pack_forget()
+            except Exception:
+                pass
+
+        if tool in ("ink", "arrow"):
+            fr = getattr(self, "_opts_ink_arrow", None)
+            if fr is not None:
+                fr.pack(fill="x", padx=0, pady=(0, 0))
+        elif tool == "textbox":
+            fr = getattr(self, "_opts_text", None)
+            if fr is not None:
+                fr.pack(fill="x", padx=0, pady=(0, 0))
+        elif tool == "image":
+            fr = getattr(self, "_opts_image", None)
+            if fr is not None:
+                fr.pack(fill="x", padx=0, pady=(0, 0))
+
+        # Remet le scroll en haut (utile si l'utilisateur a scrollé dans les options)
+        cont = getattr(self, "_pdf_opts_container", None)
+        if cont is not None:
+            try:
+                cont.scroll_to_top()
+            except Exception:
+                pass
+# ---------------- PDF Viewer helpers ----------------
+    def _viewer_zoom(self, step_or_factor: float) -> None:
+        """Zoom du PDF (step +1/-1 ou facteur 1.1/0.9)."""
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        fn = getattr(v, "zoom", None)
+        if callable(fn):
+            try:
+                fn(step_or_factor)
+            except Exception:
+                pass
+        # Le zoom re-render le canvas => il faut redessiner la ligne guide
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
+
+    def _viewer_zoom_reset(self) -> None:
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        fn = getattr(v, "zoom_reset", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+        # Le zoom re-render le canvas => il faut redessiner la ligne guide
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
+
+    def _on_annot_tool_changed(self) -> None:
+        """Rend l'outil d'annotation et le mode Sélection mutuellement exclusifs.
+
+        Problème corrigé : si Sélection est activé, un clic sur une annotation existante
+        sélectionne/déplace au lieu d'insérer (ce qui donne l'impression que l'insertion ne marche plus).
+        """
+        if getattr(self, '_sync_tool_sel_guard', False):
+            return
+        self._sync_tool_sel_guard = True
+        try:
+            tool = 'none'
+            try:
+                tool = self.ann_tool_var.get()
+            except Exception:
+                tool = 'none'
+
+            # Si un outil est sélectionné, on désactive le mode Sélection
+            if tool and tool != 'none':
+                try:
+                    if bool(self.sel_mode_var.get()):
+                        self.sel_mode_var.set(False)
+                except Exception:
+                    pass
+
+            self._sync_tool_combo_from_var()
+            self._update_annot_toolbar_state()
+            self._update_click_mode()
+        finally:
+            self._sync_tool_sel_guard = False
+
+    def _on_sel_mode_changed(self) -> None:
+        """Active Sélection => désactive l'outil actif (mutuellement exclusif)."""
+        if getattr(self, '_sync_tool_sel_guard', False):
+            return
+        self._sync_tool_sel_guard = True
+        try:
+            sel = False
+            try:
+                sel = bool(self.sel_mode_var.get())
+            except Exception:
+                sel = False
+
+            if sel:
+                try:
+                    if self.ann_tool_var.get() != 'none':
+                        self.ann_tool_var.set('none')
+                except Exception:
+                    pass
+
+            self._update_annot_toolbar_state()
+            self._update_click_mode()
+        finally:
+            self._sync_tool_sel_guard = False
 
     def _sync_tool_combo_from_var(self) -> None:
         """Synchronise la combobox d'outils (UI) avec self.ann_tool_var (logique).
@@ -749,18 +1512,48 @@ class AppWindow:
             set_state(ann_text, False)
             set_state(txt_color, False)
             set_state(txt_size, False)
+            try:
+                self.image_tool.set_enabled(False)
+            except Exception:
+                pass
         elif tool == "textbox":
             set_state(ann_color, False)
             set_state(ann_width, False)
             set_state(ann_text, True)
             set_state(txt_color, True)
             set_state(txt_size, True)
+            try:
+                self.image_tool.set_enabled(False)
+            except Exception:
+                pass
+        elif tool == "image":
+            # insertion d'image : on désactive les réglages d'encre/texte
+            set_state(ann_color, False)
+            set_state(ann_width, False)
+            set_state(ann_text, False)
+            set_state(txt_color, False)
+            set_state(txt_size, False)
+            try:
+                self.image_tool.set_enabled(True)
+            except Exception:
+                pass
         else:
             set_state(ann_color, False)
             set_state(ann_width, False)
             set_state(ann_text, False)
             set_state(txt_color, False)
             set_state(txt_size, False)
+            try:
+                self.image_tool.set_enabled(False)
+            except Exception:
+                pass
+
+
+        # Affiche uniquement les options utiles (si le panneau Options est ouvert)
+        try:
+            self._show_pdf_tool_options(tool)
+        except Exception:
+            pass
 
         has_sel = bool(getattr(self, "_selected_ann_ids", set()))
         set_state(getattr(self, "_btn_del_sel", None), has_sel)
@@ -771,6 +1564,34 @@ class AppWindow:
         if key in BASIC_COLORS:
             return BASIC_COLORS[key]
         return BASIC_COLORS.get(default_name, "#3B82F6")
+
+    def _get_text_tool_content(self) -> str:
+        """Retourne le contenu du champ texte (multi-lignes)."""
+        w = getattr(self, "_ann_text_widget", None)
+        if w is not None:
+            try:
+                return str(w.get("1.0", "end-1c"))
+            except Exception:
+                pass
+        try:
+            return str(self.text_value_var.get() or "")
+        except Exception:
+            return ""
+
+    def _set_text_tool_content(self, text: str) -> None:
+        """Met à jour le champ texte (multi-lignes) + la var compat."""
+        try:
+            self.text_value_var.set(text)
+        except Exception:
+            pass
+        w = getattr(self, "_ann_text_widget", None)
+        if w is not None:
+            try:
+                w.delete("1.0", "end")
+                if text:
+                    w.insert("1.0", text)
+            except Exception:
+                pass
 
     def _reset_draw_state(self) -> None:
         self._draw_kind = None
@@ -784,6 +1605,47 @@ class AppWindow:
         self._move_anchor = None
         self._move_snapshot = None
         self._move_has_moved = False
+
+    # ---------------- Régénération (debounce) ----------------
+    def _schedule_regenerate(self, delay_ms: int = 140) -> None:
+        """Planifie une régénération du PDF corrigé en 'debounce'.
+
+        Permet d'enchaîner plusieurs insertions (texte, flèches, images…) sans
+        payer le coût d'une régénération complète à chaque clic. Améliore aussi
+        la robustesse (moins de rechargements PDF au milieu des interactions).
+        """
+        try:
+            if self._regen_after_id is not None:
+                self.root.after_cancel(self._regen_after_id)
+        except Exception:
+            pass
+        self._regen_after_id = None
+
+        # Si pas de projet/doc actif, on ne fait rien.
+        if not self.project or not self.project.get_current_doc():
+            return
+
+        def _run():
+            self._regen_after_id = None
+            try:
+                # Si l'utilisateur est en train de cliquer / glisser dans le PDF,
+                # on décale la régénération : sinon open_pdf(...) peut interrompre
+                # l'interaction et faire "disparaître" les insertions suivantes.
+                if bool(getattr(self, "_pdf_mouse_down", False)) or getattr(self, "_draw_kind", None):
+                    self._schedule_regenerate(delay_ms=120)
+                    return
+                self.c_regenerate()
+            except Exception:
+                # c_regenerate affiche déjà des messagebox si besoin
+                pass
+
+        try:
+            self._regen_after_id = self.root.after(max(20, int(delay_ms)), _run)
+        except Exception:
+            try:
+                _run()
+            except Exception:
+                pass
 
     # ---------------- Sélection / suppression d'annotations ----------------
     def _update_selection_info(self) -> None:
@@ -899,6 +1761,24 @@ class AppWindow:
             d = math.hypot(dx, dy)
             return d if d <= pad else None
 
+        # Image : rect (même hit-test que textbox)
+        if kind == "image":
+            rect = ann.get("rect")
+            if not (isinstance(rect, list) and len(rect) == 4):
+                return None
+            x0, y0, x1, y1 = [float(v) for v in rect]
+            if x0 > x1:
+                x0, x1 = x1, x0
+            if y0 > y1:
+                y0, y1 = y1, y0
+            pad = 8.0
+            if (x0 - pad) <= x_pt <= (x1 + pad) and (y0 - pad) <= y_pt <= (y1 + pad):
+                return 0.0
+            dx = 0.0 if x0 <= x_pt <= x1 else min(abs(x_pt - x0), abs(x_pt - x1))
+            dy = 0.0 if y0 <= y_pt <= y1 else min(abs(y_pt - y0), abs(y_pt - y1))
+            d = math.hypot(dx, dy)
+            return d if d <= pad else None
+
         # Flèche : segment start-end
         if kind == "arrow":
             try:
@@ -956,9 +1836,39 @@ class AppWindow:
 
 
     def _on_pdf_click(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        # marque le début d'une interaction souris sur le canvas PDF (utilisé par le debounce regen)
+        self._pdf_mouse_down = True
         self._last_interaction_page = int(page_index)
-        # Priorité : si le mode sélection est activé et qu'on clique sur une annotation,
-        # on sélectionne puis on prépare un déplacement (glisser-déposer).
+        # 1) Outils d'annotation (Texte / Flèche / Encre / Image)
+        # Priorité volontaire : si un outil est actif, on insère même si "Sélection" est cochée.
+        # Sinon, un clic près d'une annotation existante (ex: la zone de texte insérée juste avant)
+        # déclenche un déplacement au lieu d'une nouvelle insertion, ce qui donne l'impression que
+        # "ça ne marche plus".
+        tool = self.ann_tool_var.get()
+        if tool != "none":
+            if not self._require_doc():
+                return
+
+            # Pour éviter toute confusion, on efface la sélection courante dès qu'on est en mode insertion.
+            if self._selected_ann_ids:
+                self._selected_ann_ids.clear()
+                self._update_selection_info()
+
+            self._draw_kind = tool
+            self._draw_page = int(page_index)
+
+            if tool == "ink":
+                self._draw_points = [(float(x_pt), float(y_pt))]
+                return
+
+            if tool in ("arrow", "textbox", "image"):
+                self._draw_start = (float(x_pt), float(y_pt))
+                self._draw_end = (float(x_pt), float(y_pt))
+                return
+
+            return
+
+        # 2) Mode sélection : si on clique sur une annotation, on la sélectionne et on prépare un déplacement.
         sel_on = False
         try:
             sel_on = bool(self.sel_mode_var.get())
@@ -986,29 +1896,10 @@ class AppWindow:
                     self._click_hint.configure(text="Mode clic : ON • sélection/déplacement (glisse pour déplacer)")
                 return
             else:
-                # clic dans le vide : on désélectionne, mais on laisse les outils d'annotation fonctionner
+                # clic dans le vide : on désélectionne
                 if self._selected_ann_ids:
                     self._selected_ann_ids.clear()
                     self._update_selection_info()
-
-        # 1) outils d'annotation ?
-        tool = self.ann_tool_var.get()
-        if tool != "none":
-            if not self._require_doc():
-                return
-            self._draw_kind = tool
-            self._draw_page = int(page_index)
-
-            if tool == "ink":
-                self._draw_points = [(float(x_pt), float(y_pt))]
-                return
-
-            if tool in ("arrow", "textbox"):
-                self._draw_start = (float(x_pt), float(y_pt))
-                self._draw_end = (float(x_pt), float(y_pt))
-                return
-
-            return
 
         # 2) sinon: pastilles (Correction V0 uniquement)
         try:
@@ -1044,13 +1935,32 @@ class AppWindow:
             kind = orig.get("kind") if isinstance(orig, dict) else None
 
             if kind == "score_circle":
+                # Option "Aligner dans la marge" (Correction V0) : verrouille X à la distance choisie du bord gauche
                 cx = float(orig.get("x_pt", 0.0)) + dx
                 cy = float(orig.get("y_pt", 0.0)) + dy
-                target["x_pt"] = cx
+                try:
+                    sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+                except Exception:
+                    sub = ""
+                if sub == "Correction V0" and self._corr_align_margin_enabled():
+                    target["x_pt"] = float(self._corr_margin_x_pt())
+                else:
+                    target["x_pt"] = cx
                 target["y_pt"] = cy
                 return
 
             if kind == "textbox":
+                rect = orig.get("rect")
+                if isinstance(rect, (list, tuple)) and len(rect) == 4:
+                    target["rect"] = [
+                        float(rect[0]) + dx,
+                        float(rect[1]) + dy,
+                        float(rect[2]) + dx,
+                        float(rect[3]) + dy,
+                    ]
+                return
+
+            if kind == "image":
                 rect = orig.get("rect")
                 if isinstance(rect, (list, tuple)) and len(rect) == 4:
                     target["rect"] = [
@@ -1083,8 +1993,9 @@ class AppWindow:
             return
 
         # 2) dessin (outil combo)
-        tool = self.ann_tool_var.get()
-        if tool != "none":
+        # Robustesse : on se base sur l'état de dessin démarré au clic (self._draw_kind)
+        # plutôt que sur la valeur courante de ann_tool_var (qui peut changer entre temps).
+        if self._draw_kind in ("ink", "arrow", "textbox", "image"):
             if self._draw_page is None or int(page_index) != int(self._draw_page):
                 return
 
@@ -1097,10 +2008,8 @@ class AppWindow:
                     self._draw_points.append((float(x_pt), float(y_pt)))
                 return
 
-            if self._draw_kind in ("arrow", "textbox"):
-                self._draw_end = (float(x_pt), float(y_pt))
-                return
-
+            # arrow/text/image : on met à jour l'endpoint au fil du drag
+            self._draw_end = (float(x_pt), float(y_pt))
             return
 
         # 3) pastilles: déplacement éventuel
@@ -1112,121 +2021,205 @@ class AppWindow:
             self._on_pdf_drag_for_correction(page_index, x_pt, y_pt)
 
     def _on_pdf_release(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        # fin interaction souris : important pour ne pas régénérer au milieu d'un clic
+        self._pdf_mouse_down = False
         # Fin d'un déplacement (mode sélection)
         if self._draw_kind == "move":
             moved = bool(getattr(self, "_move_has_moved", False))
             if moved and self._require_doc():
+                # Snap X pour les pastilles (score_circle) si "Aligner dans la marge" est coché (Correction V0)
+                try:
+                    sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+                except Exception:
+                    sub = ""
+                if sub == "Correction V0" and self._corr_align_margin_enabled():
+                    try:
+                        anns = self._annotations_for_current_doc()
+                        for a in anns:
+                            if isinstance(a, dict) and str(a.get("id", "")) == str(self._move_ann_id) and a.get("kind") == "score_circle":
+                                a["x_pt"] = float(self._corr_margin_x_pt())
+                                break
+                    except Exception:
+                        pass
+
                 try:
                     # persiste et régénère pour voir le résultat dans la vue PDF
                     self.project.save()
                 except Exception:
                     pass
                 try:
-                    self.c_regenerate()
+                    self._schedule_regenerate()
                 except Exception:
                     pass
             self._reset_draw_state()
             return
 
-        tool = self.ann_tool_var.get()
-        if tool != "none":
-            if not self._require_doc():
-                self._reset_draw_state()
-                return
+        kind = self._draw_kind
+        if kind in ("ink", "arrow", "textbox", "image"):
+            # Insertion d'annotations (robuste)
+            try:
+                if not self._require_doc():
+                    return
+                if self._draw_page is None:
+                    return
 
-            if self._draw_page is None or int(page_index) != int(self._draw_page):
-                self._reset_draw_state()
-                return
+                start_page = int(self._draw_page)
+                anns = self._annotations_for_current_doc()
 
-            assert self.project is not None
-            doc = self.project.get_current_doc()
-            assert doc is not None
+                if kind == "ink":
+                    if len(self._draw_points) >= 2:
+                        ann = {
+                            "id": str(uuid.uuid4()),
+                            "kind": "ink",
+                            "page": int(start_page),
+                            "points": [[p[0], p[1]] for p in self._draw_points],
+                            "style": {
+                                "color": self._color_hex(self.ann_color_var.get(), "bleu"),
+                                "width_pt": float(self.ann_width_var.get()),
+                            },
+                            "payload": {},
+                        }
+                        anns.append(ann)
+                        assert self.project is not None
+                        self.project.save()
+                        self._schedule_regenerate()
+                    return
 
-            anns = self._annotations_for_current_doc()
+                if kind == "arrow":
+                    s = self._draw_start
+                    e = self._draw_end or (float(x_pt), float(y_pt))
+                    if s and e:
+                        ann = {
+                            "id": str(uuid.uuid4()),
+                            "kind": "arrow",
+                            "page": int(start_page),
+                            "start": [float(s[0]), float(s[1])],
+                            "end": [float(e[0]), float(e[1])],
+                            "style": {
+                                "color": self._color_hex(self.ann_color_var.get(), "bleu"),
+                                "width_pt": float(self.ann_width_var.get()),
+                            },
+                            "payload": {},
+                        }
+                        anns.append(ann)
+                        assert self.project is not None
+                        self.project.save()
+                        self._schedule_regenerate()
+                    return
 
-            if tool == "ink":
-                if len(self._draw_points) >= 2:
+                if kind == "image":
+                    s = self._draw_start
+                    e = self._draw_end or (float(x_pt), float(y_pt))
+                    if not s or not e:
+                        return
+
+                    # construit une annotation image via le module (gestion bibliothèque / ratio)
+                    ann = None
+                    try:
+                        ann = self.image_tool.build_annotation(
+                            int(start_page),
+                            (float(s[0]), float(s[1])),
+                            (float(e[0]), float(e[1])),
+                            (float(x_pt), float(y_pt)),
+                        )
+                    except Exception:
+                        ann = None
+
+                    if not ann:
+                        messagebox.showwarning("Image", "Aucune image sélectionnée (ou bibliothèque vide).")
+                        return
+
+                    anns.append(ann)
+                    assert self.project is not None
+                    self.project.save()
+                    self._schedule_regenerate()
+                    return
+
+                if kind == "textbox":
+                    s = self._draw_start
+                    e = self._draw_end or (float(x_pt), float(y_pt))
+                    if not s or not e:
+                        return
+
+                    x0, y0 = s
+                    x1, y1 = e
+
+                    # Multi-lignes: on lit depuis le champ (Options) ; si vide on ouvre un dialogue multi-lignes.
+                    text_val = (self._get_text_tool_content() or "").rstrip()
+                    if not text_val:
+                        text_val = MultiLineTextDialog.ask(
+                            self.root,
+                            title="Texte",
+                            prompt="Contenu de la zone de texte (multi-lignes) :",
+                            initial="",
+                        )
+                        text_val = (text_val or "").rstrip()
+                        if text_val:
+                            # pratique: garde le texte dans les options pour les insertions suivantes
+                            self._set_text_tool_content(text_val)
+
+                    if not text_val:
+                        return
+
+                    # --- Rect robuste ---
+                    # Si l'utilisateur ne dessine pas (clic simple), on calcule une hauteur suffisante
+                    # pour afficher toutes les lignes. Sinon, on respecte le rectangle dessiné.
+                    # IMPORTANT: beaucoup d'utilisateurs cliquent (sans drag) -> si la hauteur est fixe (40pt),
+                    # seules 1 ligne (voire 2) apparaissent, donnant l'impression que "seule la première ligne" est insérée.
+                    fontsize = float(self.text_size_var.get())
+                    padding = 4.0
+                    lines = text_val.splitlines() or [text_val]
+                    n_lines = max(1, len(lines))
+                    line_h = max(10.0, fontsize * 1.25)
+                    min_h_for_text = padding * 2 + n_lines * line_h + 2
+
+                    if abs(x1 - x0) < 6 or abs(y1 - y0) < 6:
+                        # largeur par défaut + hauteur adaptée au nombre de lignes
+                        x1 = x0 + 260
+                        y1 = y0 + max(44.0, float(min_h_for_text))
+                    else:
+                        # rectangle dessiné : si trop petit, on l'agrandit légèrement en hauteur
+                        if abs(y1 - y0) < min_h_for_text:
+                            y1 = y0 + float(min_h_for_text)
+
+                    rect = [float(x0), float(y0), float(x1), float(y1)]
+
                     ann = {
                         "id": str(uuid.uuid4()),
-                        "kind": "ink",
-                        "page": int(page_index),
-                        "points": [[p[0], p[1]] for p in self._draw_points],
+                        "kind": "textbox",
+                        "page": int(start_page),
+                        "rect": rect,
+                        "text": text_val,
                         "style": {
-                            "color": self._color_hex(self.ann_color_var.get(), "bleu"),
-                            "width_pt": float(self.ann_width_var.get()),
+                            "color": self._color_hex(self.text_color_var.get(), "bleu"),
+                            "fontsize": fontsize,
                         },
                         "payload": {},
                     }
                     anns.append(ann)
+                    assert self.project is not None
                     self.project.save()
-                    self.c_regenerate()
-                self._reset_draw_state()
-                return
+                    self._schedule_regenerate()
 
-            if tool == "arrow":
-                s = self._draw_start
-                e = self._draw_end or (float(x_pt), float(y_pt))
-                if s and e:
-                    ann = {
-                        "id": str(uuid.uuid4()),
-                        "kind": "arrow",
-                        "page": int(page_index),
-                        "start": [float(s[0]), float(s[1])],
-                        "end": [float(e[0]), float(e[1])],
-                        "style": {
-                            "color": self._color_hex(self.ann_color_var.get(), "bleu"),
-                            "width_pt": float(self.ann_width_var.get()),
-                        },
-                        "payload": {},
-                    }
-                    anns.append(ann)
-                    self.project.save()
-                    self.c_regenerate()
-                self._reset_draw_state()
-                return
-
-            if tool == "textbox":
-                s = self._draw_start
-                e = self._draw_end or (float(x_pt), float(y_pt))
-                if not s or not e:
-                    self._reset_draw_state()
+                    # Feedback visuel (utile si l'utilisateur pense que "rien ne se passe")
+                    try:
+                        if hasattr(self, "_click_hint"):
+                            self._click_hint.configure(text=f"Mode clic : ON • texte ajouté (p.{start_page+1})")
+                    except Exception:
+                        pass
                     return
 
-                x0, y0 = s
-                x1, y1 = e
-                # rect normalisé + taille minimale
-                if abs(x1 - x0) < 6 or abs(y1 - y0) < 6:
-                    x1 = x0 + 220
-                    y1 = y0 + 40
-                rect = [float(x0), float(y0), float(x1), float(y1)]
-
-                text = self.text_value_var.get().strip()
-                if not text:
-                    text = simpledialog.askstring("Texte", "Contenu de la zone de texte :", parent=self.root) or ""
-                    text = text.strip()
-                if not text:
-                    self._reset_draw_state()
-                    return
-
-                ann = {
-                    "id": str(uuid.uuid4()),
-                    "kind": "textbox",
-                    "page": int(page_index),
-                    "rect": rect,
-                    "text": text,
-                    "style": {
-                        "color": self._color_hex(self.text_color_var.get(), "bleu"),
-                        "fontsize": float(self.text_size_var.get()),
-                    },
-                    "payload": {},
-                }
-                anns.append(ann)
-                self.project.save()
-                self.c_regenerate()
-                self._reset_draw_state()
+                # outil inconnu
                 return
 
-            self._reset_draw_state()
+            except Exception as e:
+                # En version packagée, les exceptions Tk peuvent être silencieuses : on affiche un message clair.
+                try:
+                    messagebox.showerror("Annotation", f"Erreur insertion annotation ({kind}).\n\n{e}")
+                except Exception:
+                    pass
+            finally:
+                self._reset_draw_state()
             return
 
         # pastilles: fin déplacement
@@ -1276,6 +2269,11 @@ class AppWindow:
             return []
         ann = self.project.settings.setdefault("annotations", {})
         self.project.settings.setdefault("pastille_label_style", "blue")
+        self.project.settings.setdefault("corr_margin_cm", 0.5)
+        try:
+            self.project.settings["corr_margin_cm"] = float(self._corr_margin_cm())
+        except Exception:
+            pass
         if not isinstance(ann, dict):
             ann = {}
             self.project.settings["annotations"] = ann
@@ -1308,24 +2306,41 @@ class AppWindow:
     def _ensure_project_margins(self) -> None:
         if not self.project:
             return
-        left_margin_cm = float(self.project.settings.get("left_margin_cm", 5.0))
+
+        left_cm, right_cm = self._get_project_margins_lr()
+
+        def _fmt_cm(v: float) -> str:
+            s = f"{float(v):g}"
+            return s.replace(".", "p")
+
         for doc in self.project.documents:
             if "margin" in doc.variants:
                 p = self.project.rel_to_abs(doc.variants["margin"])
                 if p.exists():
                     continue
+
             if not doc.input_rel:
                 continue
             src = self.project.rel_to_abs(doc.input_rel)
             if not src.exists():
                 continue
-            out_work = self.project.unique_work_path(f"{doc.id}__marge_5cm.pdf")
+
+            # Pas de marge : la variante 'margin' pointe sur l'input
+            if left_cm <= 0.0 and right_cm <= 0.0:
+                doc.variants["margin"] = doc.input_rel
+                continue
+
+            out_work = self.project.unique_work_path(
+                f"{doc.id}__marge_L{_fmt_cm(left_cm)}_R{_fmt_cm(right_cm)}cm.pdf"
+            )
             try:
-                add_left_margin(src, out_work, margin_cm=left_margin_cm)
+                add_margins(src, out_work, left_cm=left_cm, right_cm=right_cm)
                 doc.variants["margin"] = self.project.abs_to_rel(out_work)
             except Exception:
                 pass
+
         self.project.save()
+
 
     def _open_doc_in_viewer(self, doc_id: str, prefer_corrected: bool = True) -> None:
         assert self.project is not None
@@ -1345,6 +2360,10 @@ class AppWindow:
 
         self.project.current_doc_id = doc_id
         self.viewer.open_pdf(view_abs)
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
         self.nb.select(self.tab_view)
         self.view_subtabs.select(self.sub_correction)
         self._update_click_mode()
@@ -1366,6 +2385,10 @@ class AppWindow:
             messagebox.showwarning("Correction", "Le PDF corrigé est introuvable.")
             return
         self.viewer.open_pdf(p)
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
 
     # ---------------- Projet ----------------
     def new_project(self) -> None:
@@ -1386,7 +2409,18 @@ class AppWindow:
             self.c_label_style_var.set(str(self.project.settings.get("pastille_label_style", "blue")))
         except Exception:
             pass
+        self.project.settings.setdefault("corr_margin_cm", 0.5)
+        try:
+            self.c_align_margin_cm_var.set(str(self.project.settings.get("corr_margin_cm", 0.5)))
+        except Exception:
+            pass
         self.project.save()
+
+        # recharge la bibliothèque d'images (outil Image)
+        try:
+            self.image_tool.refresh_options()
+        except Exception:
+            pass
 
         self.project_name_var.set(self.project.name)
         self._refresh_files_list()
@@ -1417,7 +2451,18 @@ class AppWindow:
             self.c_label_style_var.set(str(self.project.settings.get("pastille_label_style", "blue")))
         except Exception:
             pass
+        self.project.settings.setdefault("corr_margin_cm", 0.5)
+        try:
+            self.c_align_margin_cm_var.set(str(self.project.settings.get("corr_margin_cm", 0.5)))
+        except Exception:
+            pass
         self.project.save()
+
+        # recharge la bibliothèque d'images (outil Image)
+        try:
+            self.image_tool.refresh_options()
+        except Exception:
+            pass
 
         self._ensure_project_margins()
 
@@ -1440,6 +2485,12 @@ class AppWindow:
         self.project.settings["grading_scheme"] = ensure_scheme_dict(self.project.settings.get("grading_scheme"))
         self.project.settings.setdefault("annotations", {})
         self.project.settings.setdefault("pastille_label_style", "blue")
+        # Distance d'alignement dans la marge (Correction V0)
+        self.project.settings.setdefault("corr_margin_cm", 0.5)
+        try:
+            self.project.settings["corr_margin_cm"] = float(self._corr_margin_cm())
+        except Exception:
+            pass
         try:
             self.project.save()
         except Exception as e:
@@ -1462,6 +2513,86 @@ class AppWindow:
         except Exception:
             pass
         return False
+
+    # ---------------- Ligne guide : alignement marge (Correction V0) ----------------
+    def _clear_margin_guide(self) -> None:
+        """Supprime la ligne guide d'alignement (si présente)."""
+        try:
+            v = getattr(self, "viewer", None)
+            if v is None:
+                return
+            c = getattr(v, "canvas", None)
+            if c is None:
+                return
+            c.delete("margin_guide")
+        except Exception:
+            pass
+
+    def _update_margin_guide(self) -> None:
+        """Affiche/masque la ligne guide verticale à la distance choisie (si 'Aligner dans la marge' est coché)."""
+        # Toujours commencer par nettoyer
+        self._clear_margin_guide()
+
+        # Conditions d'affichage : onglet Visualisation PDF + sous-onglet Correction V0 + option cochée
+        try:
+            main = self.nb.tab(self.nb.select(), "text")
+        except Exception:
+            main = ""
+        try:
+            sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
+        except Exception:
+            sub = ""
+
+        if main != "Visualisation PDF" or sub != "Correction V0":
+            return
+
+        try:
+            if not bool(self.c_align_margin_var.get()):
+                return
+        except Exception:
+            return
+
+        v = getattr(self, "viewer", None)
+        if v is None:
+            return
+        canvas = getattr(v, "canvas", None)
+        if canvas is None:
+            return
+
+        layout = getattr(v, "_layout", None)
+        if not layout:
+            return
+
+        try:
+            zoom = float(v.get_zoom()) if hasattr(v, "get_zoom") else float(getattr(v, "_zoom", 1.0) or 1.0)
+        except Exception:
+            zoom = 1.0
+
+        # X en pixels : distance choisie depuis le bord gauche (points -> pixels via zoom)
+        try:
+            x_px = float(self._corr_margin_x_pt()) * zoom
+        except Exception:
+            return
+
+        for info in layout:
+            try:
+                y0 = float(info.get("y0", 0.0))
+                y1 = y0 + float(info.get("h_px", 0.0))
+            except Exception:
+                continue
+            try:
+                canvas.create_line(
+                    x_px, y0, x_px, y1,
+                    fill="#2F81F7",
+                    width=2,
+                    dash=(6, 4),
+                    tags=("margin_guide",),
+                    state="disabled",
+                )
+            except Exception:
+                pass
+
+
 
     def _on_global_mousewheel(self, event) -> str | None:
         """Route la molette vers la zone sous le curseur (panneau correction ou PDF)."""
@@ -1534,11 +2665,22 @@ class AppWindow:
             return
         assert self.project is not None
 
+        # Demande les options de marge avant l'import
+        def_w, def_pos = self._get_import_margin_choice_default()
+        choice = self._ask_import_margin_options(def_w, def_pos)
+        if choice is None:
+            return
+        width_cm, position = choice
+        left_cm, right_cm = self._apply_import_margin_choice_to_settings(width_cm, position)
+
         paths = filedialog.askopenfilenames(title="Sélectionner des PDF", filetypes=[("PDF", "*.pdf")])
         if not paths:
             return
 
-        left_margin_cm = float(self.project.settings.get("left_margin_cm", 5.0))
+        def _fmt_cm(v: float) -> str:
+            s = f"{float(v):g}"
+            return s.replace(".", "p")
+
         last_doc_id: str | None = None
 
         for p in paths:
@@ -1551,9 +2693,15 @@ class AppWindow:
                 if not input_abs or not input_abs.exists():
                     raise FileNotFoundError("Fichier input introuvable après copie.")
 
-                out_work = self.project.unique_work_path(f"{doc.id}__marge_5cm.pdf")
-                add_left_margin(input_abs, out_work, margin_cm=left_margin_cm)
-                doc.variants["margin"] = self.project.abs_to_rel(out_work)
+                # Pas de marge : la variante 'margin' pointe sur l'input
+                if left_cm <= 0.0 and right_cm <= 0.0:
+                    doc.variants["margin"] = doc.input_rel
+                else:
+                    out_work = self.project.unique_work_path(
+                        f"{doc.id}__marge_L{_fmt_cm(left_cm)}_R{_fmt_cm(right_cm)}cm.pdf"
+                    )
+                    add_margins(input_abs, out_work, left_cm=left_cm, right_cm=right_cm)
+                    doc.variants["margin"] = self.project.abs_to_rel(out_work)
 
             except Exception as e:
                 messagebox.showerror("Import", f"Impossible de traiter : {src.name}\n\n{e}")
@@ -1565,6 +2713,7 @@ class AppWindow:
 
         if last_doc_id:
             self._open_doc_in_viewer(last_doc_id)
+
 
     def on_select_file(self, _evt=None) -> None:
         if not self.project:
@@ -2012,6 +3161,61 @@ class AppWindow:
         attrib = self._doc_attrib_total()
         mx = self._scheme_max_total()
         self.c_total_var.set(f"Total attribué : {attrib:g} / {mx:g}")
+    def _corr_align_margin_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "c_align_margin_var", None).get())
+        except Exception:
+            return False
+
+    def _corr_margin_cm(self) -> float:
+        """Distance (en cm) depuis le bord gauche pour l'alignement dans la marge."""
+        default = 0.5
+        raw = None
+        try:
+            raw = getattr(self, "c_align_margin_cm_var", None).get()
+        except Exception:
+            raw = None
+        if raw is None or str(raw).strip() == "":
+            try:
+                if self.project:
+                    raw = self.project.settings.get("corr_margin_cm", default)
+            except Exception:
+                raw = default
+        try:
+            cm = float(str(raw).replace(",", "."))
+        except Exception:
+            cm = float(default)
+        if cm < 0.0:
+            cm = 0.0
+        if cm > 10.0:
+            cm = 10.0
+        return float(cm)
+
+    def _apply_corr_margin_cm(self, *_evt) -> None:
+        """Normalise/enregistre la distance d'alignement et met à jour la ligne guide."""
+        cm = self._corr_margin_cm()
+        # Normalise l'affichage
+        try:
+            if hasattr(self, "c_align_margin_cm_var"):
+                txt = f"{cm:.2f}".rstrip("0").rstrip(".")
+                self.c_align_margin_cm_var.set(txt)
+        except Exception:
+            pass
+        if self.project:
+            try:
+                self.project.settings["corr_margin_cm"] = cm
+            except Exception:
+                pass
+        try:
+            self._update_margin_guide()
+        except Exception:
+            pass
+
+    def _corr_margin_x_pt(self) -> float:
+        """X (en points PDF) pour aligner une pastille à la distance choisie dans la marge."""
+        cm = self._corr_margin_cm()
+        return float((cm / 2.54) * 72.0)
+
 
     def _find_nearest_marker(self, page_index: int, x_pt: float, y_pt: float, threshold_pt: float = 14.0):
         """
@@ -2089,7 +3293,7 @@ class AppWindow:
             "id": str(uuid.uuid4()),
             "kind": "score_circle",
             "page": int(page_index),
-            "x_pt": float(x_pt),
+            "x_pt": float(self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt),
             "y_pt": float(y_pt),
             "exercise_code": code,
             "exercise_label": label,
@@ -2134,9 +3338,11 @@ class AppWindow:
         if int(ann.get("page", -1)) != int(page_index):
             return
 
-        ann["x_pt"] = float(x_pt)
-        ann["y_pt"] = float(y_pt)
+        x_use = self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt
 
+
+        ann["x_pt"] = float(x_use)
+        ann["y_pt"] = float(y_pt)
     def _on_pdf_release_for_correction(self, page_index: int, x_pt: float, y_pt: float) -> None:
         if not (hasattr(self, "c_move_var") and self.c_move_var.get()):
             return
@@ -2146,6 +3352,21 @@ class AppWindow:
             return
 
         assert self.project is not None
+
+        # Applique la position finale au relâchement (plus robuste que dépendre uniquement de <B1-Motion>)
+        try:
+            anns = self._annotations_for_current_doc()
+            idx = int(self._drag_target_idx) if self._drag_target_idx is not None else None
+            if idx is not None and 0 <= idx < len(anns):
+                ann = anns[idx]
+                if isinstance(ann, dict) and ann.get("kind") == "score_circle":
+                    x_use = self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt
+                    ann["page"] = int(page_index)
+                    ann["x_pt"] = float(x_use)
+                    ann["y_pt"] = float(y_pt)
+        except Exception:
+            pass
+
         self.project.save()
 
         # Re-génère pour appliquer le déplacement dans le PDF
@@ -2173,7 +3394,7 @@ class AppWindow:
             "id": str(uuid.uuid4()),
             "kind": "score_circle",
             "page": int(page_index),
-            "x_pt": float(x_pt),
+            "x_pt": float(self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt),
             "y_pt": float(y_pt),
             "exercise_code": code,
             "exercise_label": label or code,
@@ -2311,7 +3532,7 @@ class AppWindow:
         anns = self._annotations_for_current_doc()
         out_pdf = self.project.unique_work_path(f"{doc.id}__corrected.pdf")
         try:
-            apply_annotations(base_pdf, out_pdf, anns)
+            apply_annotations(base_pdf, out_pdf, anns, project_root=self.project.root_dir)
         except Exception as e:
             messagebox.showerror("Correction", f"Erreur génération corrigé.\n\n{e}")
             return
@@ -2320,7 +3541,40 @@ class AppWindow:
         self.project.current_variant = "corrected"
         self.project.save()
 
-        self.viewer.open_pdf(out_pdf)
+        # Rafraîchissement robuste (important en version packagée .exe : les exceptions Tk peuvent être silencieuses)
+        def _open_corrected_after_regen():
+            try:
+                self.viewer.open_pdf(out_pdf, preserve_view=True, lazy_render=True)
+                try:
+                    self._update_margin_guide()
+                except Exception:
+                    pass
+                try:
+                    self._update_click_mode()
+                except Exception:
+                    pass
+            except TypeError:
+                # Compat avec d'anciennes versions de PDFViewer.open_pdf(pdf_path)
+                self.viewer.open_pdf(out_pdf)
+                try:
+                    self._update_margin_guide()
+                except Exception:
+                    pass
+                try:
+                    self._update_click_mode()
+                except Exception:
+                    pass
+            except Exception:
+                # dernier recours : retenter un peu plus tard (écriture fichier / cache OS)
+                try:
+                    self.root.after(80, lambda: self.viewer.open_pdf(out_pdf, preserve_view=True, lazy_render=True))
+                except Exception:
+                    pass
+        # Laisse Tk finir le callback (menu/context) avant de re-render le canvas
+        try:
+            self.root.after_idle(_open_corrected_after_regen)
+        except Exception:
+            _open_corrected_after_regen()
 
     def c_delete_last(self) -> None:
         if not self._require_doc():
@@ -2367,7 +3621,7 @@ class AppWindow:
             try:
                 if isinstance(a, dict) and a.get("kind") == "textbox":
                     payload = a.get("payload") or {}
-                    if isinstance(payload, dict) and payload.get("tag") == "final_note":
+                    if isinstance(payload, dict) and payload.get("tag") in ("final_note", "final_note_marker"):
                         removed += 1
                         continue
             except Exception:
@@ -2454,7 +3708,6 @@ class AppWindow:
             lines.append(f"Note : {note20_s}/20")
 
         return "\n".join(lines).strip()
-
     def c_insert_final_note(self) -> None:
         if not self._require_doc():
             return
@@ -2494,10 +3747,23 @@ class AppWindow:
             messagebox.showwarning("Correction", "Rien à insérer (projet/document non prêt).")
             return
 
-        # Rectangle dans la marge gauche
-        left_margin_cm = float(self.project.settings.get("left_margin_cm", 5.0))
-        margin_pt = (left_margin_cm / 2.54) * 72.0
+        # Marges disponibles (cm)
+        left_cm, right_cm = self._get_project_margins_lr()
+        left_pt = (left_cm / 2.54) * 72.0
+        right_pt = (right_cm / 2.54) * 72.0
 
+        # Choix du placement :
+        # - si une marge est suffisamment large, on place le cadre dedans
+        # - sinon (marge 0 ou marge trop petite), on place en haut-gauche sur la page
+        #   avec fond semi-transparent.
+        MIN_MARGIN_PT = 110.0  # ~3,9 cm
+        placement = "overlay_topleft"
+        if left_pt >= MIN_MARGIN_PT:
+            placement = "left_margin"
+        elif right_pt >= MIN_MARGIN_PT:
+            placement = "right_margin"
+
+        # Dimensions page
         try:
             pdf = fitz.open(str(base_pdf))
             try:
@@ -2509,20 +3775,63 @@ class AppWindow:
             finally:
                 pdf.close()
         except Exception:
-            # fallback raisonnable
             w, h = 595.0, 842.0  # A4 portrait approx.
 
-        x0 = 10.0
-        x1 = min(w - 10.0, max(120.0, margin_pt - 10.0))
+        pad = 10.0
         y0 = 20.0
+
+        # Largeur du cadre (pts). En mode "overlay" (pas assez de marge),
+        # on la réduit de 50% pour éviter un cadre trop large.
+        overlay_w_normal = min(260.0, w * 0.45)
+        overlay_w_normal = max(180.0, overlay_w_normal)
+        overlay_w_overlay = overlay_w_normal * 0.5
+
+        bg_color = None
+        bg_opacity = None
+
+        if placement == "left_margin":
+            x0 = pad
+            x1 = min(w - pad, max(x0 + 80.0, left_pt - pad))
+        elif placement == "right_margin":
+            x1 = w - pad
+            x0 = max(pad, (w - right_pt) + pad)
+        else:
+            # Overlay en haut-gauche (coin haut-gauche)
+            x0 = pad
+            x1 = min(w - pad, x0 + overlay_w_overlay)
+            bg_color = "#FFFFFF"
+            bg_opacity = 0.5
+
         line_count = max(1, len(text.splitlines()))
-        est_h = 13.0 * line_count + 30.0
-        y1 = min(h - 20.0, y0 + max(140.0, est_h))
+        # En overlay (cadre plus étroit), on anticipe davantage de retours à la ligne
+        # et on augmente la hauteur minimale.
+        wrap_factor = 1.0
+        min_h = 140.0
+        if placement == "overlay_topleft":
+            wrap_factor = 1.6
+            min_h = 170.0
+
+        est_h = 13.0 * line_count * wrap_factor + 30.0
+        y1 = min(h - 20.0, y0 + max(min_h, est_h))
 
         rect = [float(x0), float(y0), float(x1), float(y1)]
 
         anns = self._annotations_for_current_doc()
         self._remove_final_note_annotations(anns)
+
+        ann_style = {
+            "color": "rouge",
+            "fontsize": 11.0,
+            "fontname": "Helvetica",
+            "border_color": "rouge",
+            "border_width_pt": 1.3,
+            "padding_pt": 5.0,
+            "bold_total": True,
+        }
+        if bg_color is not None:
+            ann_style["bg_color"] = bg_color
+        if bg_opacity is not None:
+            ann_style["fill_opacity"] = float(bg_opacity)
 
         ann = {
             "id": str(uuid.uuid4()),
@@ -2530,16 +3839,33 @@ class AppWindow:
             "page": int(page_index),
             "rect": rect,
             "text": text,
-            "style": {"color": "rouge", "fontsize": 11.0, "fontname": "Helvetica", "border_color": "rouge", "border_width_pt": 1.3, "padding_pt": 5.0, "bold_total": True},
+            "style": ann_style,
             "payload": {"tag": "final_note"},
         }
         anns.append(ann)
+
+        # Marqueur invisible pour la Synthèse Note (recherche fiable par texte)
+        mx0 = float(rect[0] + 2.0)
+        my0 = float(rect[1] + 2.0)
+        marker_rect = [mx0, my0, mx0 + 80.0, my0 + 10.0]
+        marker_ann = {
+            "id": str(uuid.uuid4()),
+            "kind": "textbox",
+            "page": int(page_index),
+            "rect": marker_rect,
+            "text": "NOTE_FINALE_BOX",
+            "style": {"color": "#FFFFFF", "fontsize": 1.0, "fontname": "Helvetica", "padding_pt": 0.0},
+            "payload": {"tag": "final_note_marker"},
+        }
+        anns.append(marker_ann)
+
         self.project.save()
 
         self.c_regenerate()
         self._refresh_marks_list()
         self._refresh_correction_totals()
         self._refresh_info_panel()
+
 
     def c_delete_final_note(self) -> None:
         if not self._require_doc():
