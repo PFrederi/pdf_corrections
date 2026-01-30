@@ -93,11 +93,7 @@ from app.core.grading import (
 )
 
 
-<<<<<<< HEAD
 APP_VERSION = "0.7.5"
-=======
-APP_VERSION = "0.0.5"
->>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
 
 
 class AppWindow:
@@ -533,7 +529,6 @@ class AppWindow:
 
         self.c_move_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Mode déplacer une pastille (cliquer-glisser)", variable=self.c_move_var).pack(anchor="w", pady=(0, 4))
-<<<<<<< HEAD
 
         if not hasattr(self, 'c_align_margin_var'):
             self.c_align_margin_var = tk.BooleanVar(value=False)
@@ -557,10 +552,6 @@ class AppWindow:
             pass
         ttk.Label(margin_row, text="ex: 0,5").pack(side="left", padx=(8, 0))
 
-=======
-        self.c_align_margin_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Aligner dans la marge", variable=self.c_align_margin_var).pack(anchor="w", pady=(0, 10))
->>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
         # Affiche/masque la ligne guide d'alignement dans la marge
         try:
             self.c_align_margin_var.trace_add("write", lambda *_: self._update_margin_guide())
@@ -1944,11 +1935,7 @@ class AppWindow:
             kind = orig.get("kind") if isinstance(orig, dict) else None
 
             if kind == "score_circle":
-<<<<<<< HEAD
                 # Option "Aligner dans la marge" (Correction V0) : verrouille X à la distance choisie du bord gauche
-=======
-                # Option "Aligner dans la marge" (Correction V0) : verrouille X à 0,5 cm du bord gauche
->>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
                 cx = float(orig.get("x_pt", 0.0)) + dx
                 cy = float(orig.get("y_pt", 0.0)) + dy
                 try:
@@ -2542,11 +2529,7 @@ class AppWindow:
             pass
 
     def _update_margin_guide(self) -> None:
-<<<<<<< HEAD
         """Affiche/masque la ligne guide verticale à la distance choisie (si 'Aligner dans la marge' est coché)."""
-=======
-        """Affiche/masque la ligne guide verticale à 0,5 cm (si 'Aligner dans la marge' est coché)."""
->>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
         # Toujours commencer par nettoyer
         self._clear_margin_guide()
 
@@ -2585,11 +2568,7 @@ class AppWindow:
         except Exception:
             zoom = 1.0
 
-<<<<<<< HEAD
         # X en pixels : distance choisie depuis le bord gauche (points -> pixels via zoom)
-=======
-        # X en pixels : 0,5 cm depuis le bord gauche (points -> pixels via zoom)
->>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
         try:
             x_px = float(self._corr_margin_x_pt()) * zoom
         except Exception:
@@ -3188,7 +3167,6 @@ class AppWindow:
         except Exception:
             return False
 
-<<<<<<< HEAD
     def _corr_margin_cm(self) -> float:
         """Distance (en cm) depuis le bord gauche pour l'alignement dans la marge."""
         default = 0.5
@@ -3237,11 +3215,6 @@ class AppWindow:
         """X (en points PDF) pour aligner une pastille à la distance choisie dans la marge."""
         cm = self._corr_margin_cm()
         return float((cm / 2.54) * 72.0)
-=======
-    def _corr_margin_x_pt(self) -> float:
-        """X (en points PDF) pour aligner une pastille à 0,5 cm du bord gauche."""
-        return float((0.5 / 2.54) * 72.0)
->>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
 
 
     def _find_nearest_marker(self, page_index: int, x_pt: float, y_pt: float, threshold_pt: float = 14.0):
