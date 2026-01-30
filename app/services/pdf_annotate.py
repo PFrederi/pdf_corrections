@@ -11,6 +11,7 @@ import fitz
 
 from app.services.pdf_margin import cm_to_pt
 from app.services.pdf_images import insert_image as _insert_pdf_image
+<<<<<<< HEAD
 
 
 _BG_IMAGE_CACHE: dict[tuple[int, int, int, int], str] = {}
@@ -46,6 +47,8 @@ def _get_solid_rgba_png(rgb01: Tuple[float, float, float], opacity: float) -> st
 
     _BG_IMAGE_CACHE[key] = str(path)
     return str(path)
+=======
+>>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
 
 
 def _hex_to_rgb01(hex_color: str) -> Tuple[float, float, float]:

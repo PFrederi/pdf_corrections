@@ -89,6 +89,7 @@ def name_from_filename(pdf_path: Path) -> str:
 
 def extract_recap_text(page: "fitz.Page") -> str:
     """
+<<<<<<< HEAD
     Extrait le texte du bloc "RÉCAPITULATIF".
 
     Priorité :
@@ -122,6 +123,12 @@ def extract_recap_text(page: "fitz.Page") -> str:
             pass
 
     # 2) Recherche du mot "RÉCAPITULATIF" avec coordonnées (heuristique historique)
+=======
+    Essaie d'abord de "clipper" la zone de gauche autour du mot RÉCAPITULATIF,
+    puis fallback sur tout le texte si on ne trouve pas.
+    """
+    # Recherche du mot "RÉCAPITULATIF" avec coordonnées
+>>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
     try:
         words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_no)
     except Exception:
@@ -133,7 +140,12 @@ def extract_recap_text(page: "fitz.Page") -> str:
         if _RE_RECAP.fullmatch(word) or _RE_RECAP.search(word):
             x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
             # Le cadre rouge est typiquement en haut à gauche.
+<<<<<<< HEAD
             # On prend une zone large vers le bas, sur ~45% de la largeur de page.
+=======
+            # On prend une zone large vers le bas, sur ~40% de la largeur de page.
+            page_rect = page.rect
+>>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
             left = 0
             top = max(0, y0 - 30)
             right = page_rect.width * 0.45
@@ -149,7 +161,11 @@ def extract_recap_text(page: "fitz.Page") -> str:
         except Exception:
             pass
 
+<<<<<<< HEAD
     # 3) Fallback : tout le texte de la page
+=======
+    # Fallback : tout le texte de la page
+>>>>>>> 4201597f12f2466f99b49d2bcf026dd86c87bc09
     return page.get_text("text")
 
 
