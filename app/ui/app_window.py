@@ -95,11 +95,7 @@ from app.core.grading import (
 )
 
 
-<<<<<<< HEAD
 APP_VERSION = "0.7.8"
-=======
-APP_VERSION = "0.7.7"
->>>>>>> 41bf947b5087f32e593815e70c8fd51a79f3d10e
 
 
 class AppWindow:
@@ -4967,14 +4963,9 @@ class AppWindow:
             at = float(attrib_by_ex.get(ex_code, 0.0))
             # format compact (préserve la largeur de la marge)
             prefix = f"Ex {ex_code}"
-<<<<<<< HEAD
             # Marque de points manuels: indique par "*" dans le récapitulatif
             if 'manual_set' in locals() and ex_code in manual_set:
                 prefix = f"{prefix}*"
-=======
-            if 'manual_set' in locals() and ex_code in manual_set:
-                prefix = f"{prefix} (M)"
->>>>>>> 41bf947b5087f32e593815e70c8fd51a79f3d10e
             lines.append(f"{prefix} : {at:g}/{mx:g}")
 
         lines.append("")

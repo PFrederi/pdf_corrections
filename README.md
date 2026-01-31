@@ -1,6 +1,6 @@
 # Corrections PDF — Projets (Tkinter)
 
-**Version : v0.7.7**
+**Version : v0.7.8**
 
 Fonctions :
 
