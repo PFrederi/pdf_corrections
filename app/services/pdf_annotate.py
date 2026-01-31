@@ -97,6 +97,29 @@ def _resolve_color(color_any: Any, default_hex: str = "#111827") -> Tuple[float,
             return _hex_to_rgb01(s)
     return _hex_to_rgb01(default_hex)
 
+
+def _blend_with_white(rgb01: Tuple[float, float, float], factor: float) -> Tuple[float, float, float]:
+    """Mélange une couleur avec du blanc.
+
+    Objectif : simuler une transparence (aperçu overlay) même lorsque certaines
+    primitives PyMuPDF ne gèrent pas l'opacité.
+
+    - factor=1.0 -> couleur inchangée
+    - factor=0.5 -> couleur "éclaircie" (≈ 50% sur fond blanc)
+    - factor=0.0 -> blanc
+    """
+    try:
+        f = float(factor)
+    except Exception:
+        f = 1.0
+    f = max(0.0, min(1.0, f))
+    r, g, b = rgb01
+    return (
+        1.0 - (1.0 - float(r)) * f,
+        1.0 - (1.0 - float(g)) * f,
+        1.0 - (1.0 - float(b)) * f,
+    )
+
 def _resolve_font_request(style: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     """
     Retourne (fontname, fontfile).
@@ -170,6 +193,7 @@ def apply_annotations(
     out_pdf: Path,
     annotations: List[Dict[str, Any]],
     project_root: Optional[Path] = None,
+    opacity_factor: float = 1.0,
 ) -> None:
     """
     Applique les annotations:
@@ -182,6 +206,28 @@ def apply_annotations(
     base_pdf = Path(base_pdf)
     out_pdf = Path(out_pdf)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    # Facteur global (0..1). Sert principalement à l'aperçu des overlays (GuideCorrection).
+    try:
+        g_op = float(opacity_factor)
+    except Exception:
+        g_op = 1.0
+    g_op = max(0.0, min(1.0, g_op))
+
+    def _adj_color(rgb: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        # Simulation d'opacité sur fond blanc
+        return _blend_with_white(rgb, g_op) if g_op < 0.999 else rgb
+
+    def _adj_opacity(op: Optional[float]) -> Optional[float]:
+        if op is None:
+            return (g_op if g_op < 0.999 else None)
+        try:
+            v = float(op)
+        except Exception:
+            v = 1.0
+        v = max(0.0, min(1.0, v))
+        v = v * g_op
+        return max(0.0, min(1.0, v))
 
     doc = fitz.open(str(base_pdf))
     try:
@@ -211,7 +257,7 @@ def apply_annotations(
                 label_size = float(style.get("label_fontsize", 11.0))
                 label_dx = float(style.get("label_dx_pt", radius + 6.0))
 
-                fill = _resolve_color(fill_hex, default_hex=RESULT_COLORS["good"])
+                fill = _adj_color(_resolve_color(fill_hex, default_hex=RESULT_COLORS["good"]))
 
                 # Style du libellé (compat: si absent -> bleu normal)
                 label_style = str(style.get("label_style") or "blue").strip().lower()
@@ -224,18 +270,57 @@ def apply_annotations(
                 else:
                     label_color_any = label_color_any or LABEL_BLUE
 
-                label_color = _resolve_color(label_color_any, default_hex=LABEL_BLUE)
+                label_color = _adj_color(_resolve_color(label_color_any, default_hex=LABEL_BLUE))
                 label_font = "Helvetica-Bold" if label_bold else "Helvetica"
 
                 shape = page.new_shape()
                 shape.draw_circle((x, y), radius)
-                shape.finish(color=None, fill=fill, fill_opacity=1.0)
+                # fill_opacity n'est pas garanti sur toutes les versions, d'où le mix avec blanc via _adj_color
+                shape.finish(color=None, fill=fill, fill_opacity=(g_op if g_op < 0.999 else 1.0))
                 shape.commit()
 
                 if label_text:
                     # Texte à droite (bleu)
                     text_point = (x + label_dx, y + (label_size / 3.0))
                     _insert_text_safe(page, text_point, label_text, fontsize=label_size, fontname=label_font, color=label_color, overlay=True)
+                continue
+
+
+            # ---------------- Points manuels (par exercice) ----------------
+            if kind == "manual_score":
+                x = float(ann.get("x_pt", 0))
+                y = float(ann.get("y_pt", 0))
+
+                radius = float(style.get("radius_pt", 12.0))
+                pts_val = ann.get("points", "")
+                try:
+                    pts_f = float(pts_val)
+                    # affichage compact
+                    if abs(pts_f - round(pts_f)) < 1e-9:
+                        pts_txt = str(int(round(pts_f)))
+                    else:
+                        pts_txt = f"{pts_f:g}"
+                except Exception:
+                    pts_txt = str(pts_val)
+
+                border = _adj_color(_resolve_color(style.get("border_color", BASIC_COLORS["rouge"]), default_hex=BASIC_COLORS["rouge"]))
+                fill = _adj_color(_resolve_color(style.get("fill", "#FFFFFF"), default_hex="#FFFFFF"))
+                width = float(style.get("border_width_pt", 1.6))
+                font_size = float(style.get("font_size", 11.0))
+
+                shape = page.new_shape()
+                shape.draw_circle((x, y), radius)
+                shape.finish(color=border, fill=fill, width=width, fill_opacity=(g_op if g_op < 0.999 else 1.0))
+                shape.commit()
+
+                # Texte centré approximativement
+                try:
+                    w_txt = fitz.get_text_length(pts_txt, fontname="Helvetica-Bold", fontsize=font_size)
+                except Exception:
+                    w_txt = max(6.0, font_size * 0.6 * len(pts_txt))
+                tx = x - (w_txt / 2.0)
+                ty = y + (font_size / 3.0)
+                _insert_text_safe(page, (tx, ty), pts_txt, fontsize=font_size, fontname="Helvetica-Bold", color=border, overlay=True)
                 continue
 
             # ---------------- Image (PNG) ----------------
@@ -249,7 +334,7 @@ def apply_annotations(
 
                 style = ann.get("style") or {}
                 keep_prop = bool(style.get("keep_proportion", True))
-                opacity = style.get("opacity")
+                opacity = _adj_opacity(style.get("opacity"))
 
                 # Résolution du chemin image : priorise image_rel (portabilité du projet)
                 img_ref = str(ann.get("image_rel") or ann.get("image_path") or "").strip()
@@ -281,7 +366,7 @@ def apply_annotations(
                             pass
                 if len(points) < 2:
                     continue
-                color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
+                color = _adj_color(_resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"]))
                 width = float(style.get("width_pt", 2.0))
                 page.draw_polyline(points, color=color, width=width, overlay=True)
                 continue
@@ -313,11 +398,11 @@ def apply_annotations(
 
                 if is_final:
                     # Toujours rouge + encadré (portable en packaging : Helvetica / Helvetica-Bold sont intégrées)
-                    color = _resolve_color("rouge", default_hex=BASIC_COLORS["rouge"])
-                    border_color = _resolve_color("rouge", default_hex=BASIC_COLORS["rouge"])
+                    color = _adj_color(_resolve_color("rouge", default_hex=BASIC_COLORS["rouge"]))
+                    border_color = _adj_color(_resolve_color("rouge", default_hex=BASIC_COLORS["rouge"]))
                 else:
-                    color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
-                    border_color = _resolve_color(border_color_name, default_hex=BASIC_COLORS["bleu"]) if border_color_name else None
+                    color = _adj_color(_resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"]))
+                    border_color = _adj_color(_resolve_color(border_color_name, default_hex=BASIC_COLORS["bleu"])) if border_color_name else None
 
                 # Fond (optionnel) : utile pour la note finale sans marge (overlay sur la copie)
                 bg_any = style.get("bg_color")
@@ -334,8 +419,11 @@ def apply_annotations(
 
                 if bg_any is not None:
                     try:
-                        fill = _resolve_color(bg_any, default_hex="#FFFFFF")
-                        op = float(bg_opacity) if bg_opacity is not None else 1.0
+                        fill = _adj_color(_resolve_color(bg_any, default_hex="#FFFFFF"))
+                        op_raw = float(bg_opacity) if bg_opacity is not None else None
+                        op = _adj_opacity(op_raw)
+                        if op is None:
+                            op = 1.0
                         # Fond semi-transparent : méthode la plus robuste = image RGBA
                         # (certaines versions de PyMuPDF ignorent `fill_opacity`).
                         if op < 0.999:
@@ -436,7 +524,7 @@ def apply_annotations(
                 except Exception:
                     continue
 
-                color = _resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"])
+                color = _adj_color(_resolve_color(style.get("color"), default_hex=BASIC_COLORS["bleu"]))
                 width = float(style.get("width_pt", 2.0))
 
                 page.draw_line((x0, y0), (x1, y1), color=color, width=width, overlay=True)

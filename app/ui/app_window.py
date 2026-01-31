@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path
 import fitz  # PyMuPDF
 import uuid
+from datetime import datetime
 import math
 import copy
 import sys
@@ -93,7 +95,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.7.5"
+APP_VERSION = "0.7.7"
 
 
 class AppWindow:
@@ -119,13 +121,49 @@ class AppWindow:
         self.c_align_margin_cm_var = tk.StringVar(value="0.5")
 
         # Outils d'annotation classiques (Visualisation PDF)
-        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow | image
+        self.ann_tool_var = tk.StringVar(value="none")   # none | ink | textbox | arrow | image | manual_score
         self.ann_color_var = tk.StringVar(value="bleu")  # couleur trait / flèche
         self.ann_width_var = tk.IntVar(value=3)          # épaisseur trait / flèche
 
         self.text_color_var = tk.StringVar(value="bleu") # couleur police
         self.text_size_var = tk.IntVar(value=14)         # taille police
         self.text_value_var = tk.StringVar(value="")     # texte à placer (optionnel)
+
+        # Saisie de points manuels (par exercice principal)
+        self.manual_score_ex_var = tk.StringVar(value="")
+        self.manual_score_pts_var = tk.StringVar(value="")
+
+
+        # Points manuels (par exercice principal)
+        # Outil: "Points Ex" (cercle rouge)
+        self.manual_score_ex_var = tk.StringVar(value="")
+        self.manual_score_pts_var = tk.StringVar(value="")
+
+
+
+        # GuideCorrection (overlay de correction)
+        # - un overlay est un set d'annotations (marques / images / texte / traits) enregistré et réutilisable
+        self.gc_overlay_enabled_var = tk.BooleanVar(value=False)
+        self.gc_overlay_select_var = tk.StringVar(value="")
+        self.gc_overlay_new_name_var = tk.StringVar(value="")
+        # Aperçu overlay : opacité simulée à 50% (utile pour distinguer overlay vs annotations réelles)
+        self.gc_overlay_opacity50_var = tk.BooleanVar(value=True)
+        self._viewer_base_pdf_abs: Path | None = None  # PDF actuellement affiché (sans overlay)
+
+        # Quand l'overlay est activé/désactivé ou quand la sélection change, on rafraîchit la vue (si possible)
+        try:
+            self.gc_overlay_enabled_var.trace_add("write", lambda *_: self._on_guide_overlay_state_changed())
+        except Exception:
+            pass
+        try:
+            self.gc_overlay_select_var.trace_add("write", lambda *_: self._on_guide_overlay_state_changed())
+        except Exception:
+            pass
+
+        try:
+            self.gc_overlay_opacity50_var.trace_add("write", lambda *_: self._on_guide_overlay_state_changed())
+        except Exception:
+            pass
 
 
         # Sélection d'annotations (outil 'Sélection')
@@ -411,6 +449,16 @@ class AppWindow:
             pos = "left"
         return float(width), pos
 
+
+
+
+
+
+
+
+
+
+
     def _build_tab_view(self) -> None:
         container = ttk.Frame(self.tab_view)
         container.pack(fill="both", expand=True)
@@ -418,7 +466,7 @@ class AppWindow:
         self.view_pane = ttk.Panedwindow(container, orient="horizontal")
         self.view_pane.pack(fill="both", expand=True)
 
-        # Gauche : sous-onglets (Correction / Infos)
+        # Gauche : sous-onglets (Correction / Infos / GuideCorrection)
         self.view_left = ttk.Frame(self.view_pane, width=380)
         self.view_pane.add(self.view_left, weight=0)
 
@@ -428,8 +476,12 @@ class AppWindow:
 
         self.sub_correction = ttk.Frame(self.view_subtabs)
         self.sub_info = ttk.Frame(self.view_subtabs)
+        self.sub_guidecorr = ttk.Frame(self.view_subtabs)
         self.view_subtabs.add(self.sub_correction, text="Correction V0")
-        self.view_subtabs.add(self.sub_info, text="Infos")        # Droite : PDF (+ barre d'outils)
+        self.view_subtabs.add(self.sub_info, text="Infos")
+        self.view_subtabs.add(self.sub_guidecorr, text="GuideCorrection")
+
+        # Droite : PDF (+ barre d'outils)
         self.viewer_right = ttk.Frame(self.view_pane)
         self.view_pane.add(self.viewer_right, weight=1)
 
@@ -440,9 +492,20 @@ class AppWindow:
 
         self._build_view_correction_panel()
         self._build_view_info_panel()
+        self._build_view_guidecorr_panel()
 
         self._click_hint = ttk.Label(self.view_left, text="Mode clic : OFF")
         self._click_hint.pack(anchor="w", padx=10, pady=(6, 6))
+
+
+
+
+
+
+
+
+
+
 
 
     def _toggle_view_left_pane(self) -> None:
@@ -586,6 +649,12 @@ class AppWindow:
         ttk.Label(frm, text="Marques du document :").pack(anchor="w")
         self.c_marks = tk.Listbox(frm, height=12, bg=DARK_BG_2, fg="white", highlightthickness=0, selectbackground="#2F81F7")
         self.c_marks.pack(fill="x", pady=(4, 8))
+
+        # Double-clic : édition confortable des points manuels (lignes MANUEL)
+        try:
+            self.c_marks.bind("<Double-Button-1>", self._on_marks_double_click)
+        except Exception:
+            pass
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x")
@@ -1004,6 +1073,470 @@ class AppWindow:
         _refresh_listbox()
         _setup_columns(["NOM PRENOM", "Total"])
 
+    # ---------------- UI : GuideCorrection (overlay) ----------------
+    def _build_view_guidecorr_panel(self) -> None:
+        """Panneau permettant de gérer des overlays de correction réutilisables.
+
+        Un overlay est enregistré sous forme de JSON dans le dossier du projet,
+        sous le nom: GuideCorrection_XXXXX.json (XXXXX fourni par l'utilisateur).
+
+        L'overlay peut ensuite être :
+        - prévisualisé (superposé) sur le PDF en cours de visualisation
+        - appliqué (copié) dans les marques du document courant
+        """
+        frm = ttk.Frame(self.sub_guidecorr)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Label(frm, text="GuideCorrection — Overlay de correction").pack(anchor="w")
+        ttk.Label(frm, text="Enregistre et réutilise un calque d'annotations (marques, images, texte, traits)").pack(anchor="w", pady=(4, 10))
+
+        # Sélection overlay
+        sel_box = ttk.LabelFrame(frm, text="Overlay")
+        sel_box.pack(fill="x", pady=(0, 10))
+
+        row = ttk.Frame(sel_box)
+        row.pack(fill="x", padx=10, pady=(8, 6))
+        ttk.Label(row, text="Choisir :").pack(side="left")
+
+        self.gc_overlay_combo = ttk.Combobox(row, state="readonly", width=28, textvariable=self.gc_overlay_select_var, values=[])
+        self.gc_overlay_combo.pack(side="left", padx=(8, 8))
+
+        ttk.Button(row, text="Rafraîchir", command=self._refresh_guide_overlay_list).pack(side="left")
+
+        row2 = ttk.Frame(sel_box)
+        row2.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Checkbutton(row2, text="Activer la superposition sur le PDF (prévisualisation)", variable=self.gc_overlay_enabled_var).pack(anchor="w")
+        ttk.Checkbutton(row2, text="Aperçu : opacité 50%", variable=self.gc_overlay_opacity50_var).pack(anchor="w", pady=(2, 0))
+
+        self.gc_overlay_info_var = tk.StringVar(value="—")
+        ttk.Label(sel_box, textvariable=self.gc_overlay_info_var).pack(anchor="w", padx=10, pady=(0, 8))
+
+        btn_row = ttk.Frame(sel_box)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_row, text="Appliquer au document (copier dans marques + régénérer)", command=self._apply_selected_overlay_to_current_doc).pack(side="left")
+        ttk.Button(btn_row, text="Mettre à jour l'overlay (écraser)", command=self._update_selected_overlay_from_current_doc).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Supprimer overlay", command=self._delete_selected_overlay).pack(side="left", padx=(8, 0))
+
+        # Création overlay
+        create_box = ttk.LabelFrame(frm, text="Créer un nouvel overlay")
+        create_box.pack(fill="x", pady=(0, 10))
+
+        crow = ttk.Frame(create_box)
+        crow.pack(fill="x", padx=10, pady=(8, 8))
+        ttk.Label(crow, text="Nom (XXXXX) :").pack(side="left")
+        ttk.Entry(crow, textvariable=self.gc_overlay_new_name_var, width=26).pack(side="left", padx=(8, 8))
+        ttk.Button(crow, text="Enregistrer depuis ce document", command=self._save_overlay_from_current_doc).pack(side="left")
+
+        ttk.Label(create_box, text="Astuce : place tes annotations sur un PDF 'modèle', puis enregistre l'overlay.").pack(anchor="w", padx=10, pady=(0, 10))
+
+        # init
+        self._refresh_guide_overlay_list()
+        self._refresh_guide_overlay_info()
+
+
+    # ---------------- GuideCorrection : stockage / chargement ----------------
+    def _guide_overlay_dir(self) -> Path | None:
+        if not self.project:
+            return None
+        return self.project.root_dir
+
+    def _guide_overlay_file(self, name: str) -> Path | None:
+        d = self._guide_overlay_dir()
+        if not d:
+            return None
+        safe = self._slugify_overlay_name(name)
+        return (d / f"GuideCorrection_{safe}.json").resolve()
+
+    def _slugify_overlay_name(self, name: str) -> str:
+        s = (name or '').strip()
+        if not s:
+            return ''
+        out = []
+        for ch in s:
+            if ch.isalnum():
+                out.append(ch)
+            elif ch in (' ', '-', '_'):
+                out.append('_')
+        v = ''.join(out).strip('_')
+        while '__' in v:
+            v = v.replace('__', '_')
+        return v or ''
+
+    def _list_guide_overlays(self) -> list[str]:
+        d = self._guide_overlay_dir()
+        if not d or not d.exists():
+            return []
+        out = []
+        for p in sorted(d.glob('GuideCorrection_*.json')):
+            stem = p.stem
+            # stem = GuideCorrection_XXXXX
+            name = stem[len('GuideCorrection_'):] if stem.startswith('GuideCorrection_') else stem
+            if name:
+                out.append(name)
+        return out
+
+    def _refresh_guide_overlay_list(self) -> None:
+        names = []
+        try:
+            names = self._list_guide_overlays()
+        except Exception:
+            names = []
+        try:
+            if hasattr(self, 'gc_overlay_combo'):
+                self.gc_overlay_combo.configure(values=names)
+        except Exception:
+            pass
+
+        # conserve la sélection si possible
+        try:
+            cur = (self.gc_overlay_select_var.get() or '').strip()
+        except Exception:
+            cur = ''
+        if cur and cur not in names:
+            try:
+                self.gc_overlay_select_var.set('')
+            except Exception:
+                pass
+        if not cur and names:
+            # auto-sélection du premier overlay si aucun n'est choisi
+            try:
+                self.gc_overlay_select_var.set(names[0])
+            except Exception:
+                pass
+
+        self._refresh_guide_overlay_info()
+
+    def _refresh_guide_overlay_info(self) -> None:
+        info = '—'
+        try:
+            name = (self.gc_overlay_select_var.get() or '').strip()
+        except Exception:
+            name = ''
+        if self.project and name:
+            try:
+                anns = self._load_overlay_annotations(name)
+                info = f"Annotations dans l'overlay : {len(anns)}"
+            except Exception:
+                info = 'Overlay invalide'
+        else:
+            if not self.project:
+                info = 'Ouvre un projet pour gérer les overlays.'
+            elif not name:
+                info = 'Aucun overlay sélectionné.'
+        try:
+            self.gc_overlay_info_var.set(info)
+        except Exception:
+            pass
+
+    def _load_overlay_annotations(self, name: str) -> list[dict]:
+        f = self._guide_overlay_file(name)
+        if not f or not f.exists():
+            return []
+        data = json.loads(f.read_text(encoding='utf-8'))
+        if isinstance(data, dict):
+            anns = data.get('annotations')
+        else:
+            anns = None
+        if not isinstance(anns, list):
+            return []
+        # on ne filtre pas par kind: on conserve tout
+        out = []
+        for a in anns:
+            if isinstance(a, dict):
+                out.append(a)
+        return out
+
+    # ---------------- GuideCorrection : actions UI ----------------
+    def _save_overlay_from_current_doc(self) -> None:
+        if not self._require_doc():
+            return
+        assert self.project is not None
+
+        name = (self.gc_overlay_new_name_var.get() or '').strip()
+        if not name:
+            name = simpledialog.askstring("GuideCorrection", "Nom de l'overlay (XXXXX) :", parent=self.root)
+            name = (name or '').strip()
+            if not name:
+                return
+            try:
+                self.gc_overlay_new_name_var.set(name)
+            except Exception:
+                pass
+
+        safe = self._slugify_overlay_name(name)
+        if not safe:
+            messagebox.showwarning('GuideCorrection', 'Nom invalide. Utilise uniquement lettres/chiffres/espace/_/-')
+            return
+
+        f = self._guide_overlay_file(name)
+        if not f:
+            messagebox.showwarning('GuideCorrection', 'Projet introuvable.')
+            return
+
+        if f.exists():
+            ok = messagebox.askyesno('GuideCorrection', f"L'overlay existe déjà : {f.name}\n\nÉcraser ?")
+            if not ok:
+                return
+
+        # capture des annotations du document courant
+        anns = self._annotations_for_current_doc()
+        payload = {
+            'name': safe,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'source_doc_id': str(self.project.current_doc_id or ''),
+            'annotations': anns,
+        }
+        try:
+            f.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as e:
+            messagebox.showerror('GuideCorrection', f"Impossible d'enregistrer l'overlay.\n\n{e}")
+            return
+
+        self._refresh_guide_overlay_list()
+        try:
+            self.gc_overlay_select_var.set(safe)
+        except Exception:
+            pass
+        messagebox.showinfo('GuideCorrection', f"Overlay enregistré : {f.name}\n\nAnnotations: {len(anns)}")
+
+    def _update_selected_overlay_from_current_doc(self) -> None:
+        """Met à jour (écrase) l'overlay sélectionné avec les annotations du document courant."""
+        if not self._require_doc():
+            return
+        assert self.project is not None
+
+        name = (self.gc_overlay_select_var.get() or '').strip()
+        if not name:
+            messagebox.showinfo('GuideCorrection', 'Aucun overlay sélectionné.')
+            return
+
+        safe = self._slugify_overlay_name(name)
+        if not safe:
+            messagebox.showwarning('GuideCorrection', 'Nom d\'overlay invalide.')
+            return
+
+        f = self._guide_overlay_file(safe)
+        if not f:
+            messagebox.showwarning('GuideCorrection', 'Projet introuvable.')
+            return
+
+        if f.exists():
+            ok = messagebox.askyesno('GuideCorrection', f"Mettre à jour (écraser) : {f.name} ?")
+            if not ok:
+                return
+        else:
+            ok = messagebox.askyesno('GuideCorrection', f"L'overlay n'existe pas encore : {f.name}\n\nLe créer ?")
+            if not ok:
+                return
+
+        anns = self._annotations_for_current_doc()
+
+        # conserve created_at si présent
+        created_at = datetime.now().isoformat(timespec='seconds')
+        try:
+            if f.exists():
+                prev = json.loads(f.read_text(encoding='utf-8'))
+                if isinstance(prev, dict) and prev.get('created_at'):
+                    created_at = str(prev.get('created_at'))
+        except Exception:
+            pass
+
+        payload = {
+            'name': safe,
+            'created_at': created_at,
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+            'source_doc_id': str(self.project.current_doc_id or ''),
+            'annotations': anns,
+        }
+        try:
+            f.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as e:
+            messagebox.showerror('GuideCorrection', f"Impossible de mettre à jour l'overlay.\n\n{e}")
+            return
+
+        self._refresh_guide_overlay_list()
+        try:
+            self.gc_overlay_select_var.set(safe)
+        except Exception:
+            pass
+        self._refresh_guide_overlay_info()
+        messagebox.showinfo('GuideCorrection', f"Overlay mis à jour : {f.name}\n\nAnnotations: {len(anns)}")
+
+    def _apply_selected_overlay_to_current_doc(self) -> None:
+        if not self._require_doc():
+            return
+        assert self.project is not None
+
+        name = (self.gc_overlay_select_var.get() or '').strip()
+        if not name:
+            messagebox.showinfo('GuideCorrection', 'Aucun overlay sélectionné.')
+            return
+
+        try:
+            overlay_anns = self._load_overlay_annotations(name)
+        except Exception as e:
+            messagebox.showerror('GuideCorrection', f"Overlay invalide.\n\n{e}")
+            return
+
+        if not overlay_anns:
+            messagebox.showinfo('GuideCorrection', 'Overlay vide (0 annotation).')
+            return
+
+        anns = self._annotations_for_current_doc()
+        added = 0
+        for a in overlay_anns:
+            if not isinstance(a, dict):
+                continue
+            b = copy.deepcopy(a)
+            # assure unicité des ids
+            b['id'] = str(uuid.uuid4())
+            anns.append(b)
+            added += 1
+
+        try:
+            self.project.save()
+        except Exception:
+            pass
+
+        # régénère pour voir le résultat
+        try:
+            self.c_regenerate()
+        except Exception:
+            pass
+
+        try:
+            self._refresh_marks_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_info_panel()
+        except Exception:
+            pass
+
+        messagebox.showinfo('GuideCorrection', f"Overlay appliqué au document.\nAnnotations ajoutées : {added}")
+
+    def _delete_selected_overlay(self) -> None:
+        if not self._require_project():
+            return
+        assert self.project is not None
+
+        name = (self.gc_overlay_select_var.get() or '').strip()
+        if not name:
+            messagebox.showinfo('GuideCorrection', 'Aucun overlay sélectionné.')
+            return
+
+        f = self._guide_overlay_file(name)
+        if not f or not f.exists():
+            messagebox.showwarning('GuideCorrection', 'Fichier overlay introuvable.')
+            return
+
+        ok = messagebox.askyesno('GuideCorrection', f"Supprimer définitivement : {f.name} ?")
+        if not ok:
+            return
+        try:
+            f.unlink()
+        except Exception as e:
+            messagebox.showerror('GuideCorrection', f"Impossible de supprimer.\n\n{e}")
+            return
+
+        try:
+            self.gc_overlay_select_var.set('')
+        except Exception:
+            pass
+        self._refresh_guide_overlay_list()
+
+    # ---------------- GuideCorrection : preview (superposition) ----------------
+    def _on_guide_overlay_state_changed(self) -> None:
+        """Callback: changement activation / sélection overlay -> rafraîchit le PDF affiché."""
+        # Persistance légère dans le projet
+        if self.project:
+            try:
+                self.project.settings['guide_overlay_selected'] = str(self.gc_overlay_select_var.get() or '')
+                self.project.settings['guide_overlay_enabled'] = bool(self.gc_overlay_enabled_var.get())
+                self.project.settings['guide_overlay_opacity50'] = bool(self.gc_overlay_opacity50_var.get())
+                self.project.save()
+            except Exception:
+                pass
+
+        # met à jour l'info
+        self._refresh_guide_overlay_info()
+
+        # rafraîchit la vue si on a déjà ouvert un PDF
+        base = getattr(self, '_viewer_base_pdf_abs', None)
+        if base and isinstance(base, Path) and base.exists():
+            try:
+                self._open_pdf_with_optional_overlay(base, preserve_view=True, lazy_render=True)
+            except Exception:
+                # fallback
+                try:
+                    self.viewer.open_pdf(base, preserve_view=True, lazy_render=True)
+                except Exception:
+                    pass
+
+    def _open_pdf_with_optional_overlay(self, pdf_abs: Path, *, preserve_view: bool = False, lazy_render: bool = False) -> None:
+        """Ouvre un PDF dans le viewer, en appliquant l'overlay GuideCorrection si activé."""
+        try:
+            pdf_abs = Path(pdf_abs)
+        except Exception:
+            return
+        self._viewer_base_pdf_abs = pdf_abs
+
+        use_overlay = False
+        try:
+            use_overlay = bool(self.gc_overlay_enabled_var.get())
+        except Exception:
+            use_overlay = False
+
+        name = ''
+        try:
+            name = (self.gc_overlay_select_var.get() or '').strip()
+        except Exception:
+            name = ''
+
+        if not (use_overlay and self.project and name):
+            self.viewer.open_pdf(pdf_abs, preserve_view=preserve_view, lazy_render=lazy_render)
+            return
+
+        # charge overlay
+        try:
+            overlay_anns = self._load_overlay_annotations(name)
+        except Exception:
+            overlay_anns = []
+
+        if not overlay_anns:
+            self.viewer.open_pdf(pdf_abs, preserve_view=preserve_view, lazy_render=lazy_render)
+            return
+
+        # génère un PDF temporaire dans work/ (écrasé)
+        try:
+            doc = self.project.get_current_doc()
+            doc_id = (doc.id if doc else 'doc')
+        except Exception:
+            doc_id = 'doc'
+
+        slug = self._slugify_overlay_name(name) or 'overlay'
+        out_pdf = (self.project.work_dir / f"{doc_id}__GuideCorrection_{slug}.pdf").resolve()
+        try:
+            out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            op_factor = 1.0
+            try:
+                if bool(self.gc_overlay_opacity50_var.get()):
+                    op_factor = 0.5
+            except Exception:
+                op_factor = 1.0
+
+            apply_annotations(pdf_abs, out_pdf, overlay_anns, project_root=self.project.root_dir, opacity_factor=op_factor)
+            self.viewer.open_pdf(out_pdf, preserve_view=preserve_view, lazy_render=lazy_render)
+        except Exception:
+            # si l'overlay échoue, on n'empêche pas l'ouverture du PDF
+            self.viewer.open_pdf(pdf_abs, preserve_view=preserve_view, lazy_render=lazy_render)
+
+
+
     def _update_click_mode(self, _evt=None) -> None:
         # IMPORTANT: ne pas baser la logique sur le texte des onglets (fragile si renommage).
         # On compare directement les ids Tk des widgets.
@@ -1051,10 +1584,11 @@ class AppWindow:
                         sel = bool(self.sel_mode_var.get())
                     except Exception:
                         sel = False
+                    tool_disp = self._tool_label_for_value(tool)
                     if tool != "none" and sel:
-                        label = f"ON • outil: {tool} + sélection"
+                        label = f"ON • outil: {tool_disp} + sélection"
                     elif tool != "none":
-                        label = f"ON • outil: {tool}"
+                        label = f"ON • outil: {tool_disp}"
                     elif sel:
                         label = "ON • sélection/déplacement"
                     else:
@@ -1105,6 +1639,7 @@ class AppWindow:
             ("Texte", "textbox"),
             ("Flèche", "arrow"),
             ("Image (PNG)", "image"),
+            ("Points Ex", "manual_score"),
         ]
         self._tool_label_var = tk.StringVar(value="Aucun")
         self._tool_combo = ttk.Combobox(
@@ -1415,6 +1950,17 @@ class AppWindow:
                 self._tool_combo.set(label)
             except Exception:
                 pass
+
+    def _tool_label_for_value(self, tool_value: str) -> str:
+        """Retourne le libellé UI d'un outil (valeur logique)."""
+        try:
+            tool_map = getattr(self, "_tool_map", None) or []
+            for lbl, v in tool_map:
+                if v == tool_value:
+                    return str(lbl)
+        except Exception:
+            pass
+        return str(tool_value or "")
 
     def _on_tool_combo(self) -> None:
         """Callback quand l'utilisateur change l'outil dans la combobox."""
@@ -1743,6 +2289,17 @@ class AppWindow:
             d = math.hypot(x_pt - ax, y_pt - ay)
             return d if d <= (r + 10.0) else None
 
+        # Points manuels (même hit-test qu'une pastille)
+        if kind == "manual_score":
+            try:
+                ax = float(ann.get("x_pt", 0.0))
+                ay = float(ann.get("y_pt", 0.0))
+                r = float((ann.get("style") or {}).get("radius_pt", 11.0))
+            except Exception:
+                return None
+            d = math.hypot(x_pt - ax, y_pt - ay)
+            return d if d <= (r + 10.0) else None
+
         # Zone de texte : rect
         if kind == "textbox":
             rect = ann.get("rect")
@@ -1854,6 +2411,19 @@ class AppWindow:
                 self._selected_ann_ids.clear()
                 self._update_selection_info()
 
+            if tool == "manual_score":
+                # Ajout de points manuels (par exercice principal) : insertion immédiate au clic
+                try:
+                    self._add_manual_score_at(int(page_index), float(x_pt), float(y_pt))
+                except Exception as e:
+                    try:
+                        messagebox.showerror("Points", str(e))
+                    except Exception:
+                        pass
+                finally:
+                    self._reset_draw_state()
+                return
+
             self._draw_kind = tool
             self._draw_page = int(page_index)
 
@@ -1934,7 +2504,7 @@ class AppWindow:
             orig = self._move_snapshot
             kind = orig.get("kind") if isinstance(orig, dict) else None
 
-            if kind == "score_circle":
+            if kind in ("score_circle", "manual_score"):
                 # Option "Aligner dans la marge" (Correction V0) : verrouille X à la distance choisie du bord gauche
                 cx = float(orig.get("x_pt", 0.0)) + dx
                 cy = float(orig.get("y_pt", 0.0)) + dy
@@ -2230,6 +2800,240 @@ class AppWindow:
         if sub == "Correction V0":
             self._on_pdf_release_for_correction(page_index, x_pt, y_pt)
 
+
+    def _add_manual_score_at(self, page_index: int, x_pt: float, y_pt: float) -> None:
+        """Ajoute (ou remplace) un marqueur de points manuels pour un exercice principal.
+
+        Option A : l'utilisateur sélectionne l'outil "Points Ex" puis clique dans le PDF.
+        Une fenêtre demande : exercice + points.
+
+        Règle : si un point manuel existe déjà pour cet exercice, il est remplacé.
+        """
+        if not self._require_doc():
+            return
+        assert self.project is not None
+        doc = self.project.get_current_doc()
+        assert doc is not None
+
+        scheme = self._scheme()
+        if not getattr(scheme, 'exercises', None):
+            messagebox.showwarning('Points manuels', "Aucun exercice défini dans l'onglet Notation.")
+            return
+
+        # Max points par exercice principal
+        def total_good(node) -> float:
+            if getattr(node, 'children', None):
+                return float(sum(total_good(c) for c in node.children))
+            try:
+                lvl = int(node.level())
+            except Exception:
+                lvl = 0
+            if lvl in (1, 2):
+                rub = getattr(node, 'rubric', None)
+                if rub is not None:
+                    try:
+                        return float(rub.good)
+                    except Exception:
+                        return 1.0
+                return 1.0
+            return 0.0
+
+        ex_items = []  # (code, label, max)
+        for ex in scheme.exercises:
+            try:
+                code = str(ex.code)
+            except Exception:
+                continue
+            label = str(ex.label) if getattr(ex, 'label', None) else f"Exercice {code}"
+            mx = float(total_good(ex))
+            ex_items.append((code, label, mx))
+
+        if not ex_items:
+            messagebox.showwarning('Points manuels', "Aucun exercice défini dans l'onglet Notation.")
+            return
+
+        # Valeurs par défaut persistantes
+        try:
+            if not self.manual_score_ex_var.get().strip():
+                self.manual_score_ex_var.set(ex_items[0][0])
+        except Exception:
+            pass
+
+        # --- UI dialog ---
+        top = tk.Toplevel(self.root)
+        top.title('Points manuels (exercice)')
+        top.transient(self.root)
+        top.grab_set()
+
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text='Attribuer des points manuellement (par exercice principal)').pack(anchor='w')
+        ttk.Label(frm, text="Ces points remplacent le total des pastilles de l'exercice dans la note.").pack(anchor='w', pady=(2, 10))
+
+        # Exercice
+        row1 = ttk.Frame(frm)
+        row1.pack(fill='x', pady=(0, 8))
+        ttk.Label(row1, text='Exercice :').pack(side='left')
+
+        disp = [f"Ex {c} — {lab} (max {mx:g})" for c, lab, mx in ex_items]
+        code_by_disp = {d: c for d, (c, _, _) in zip(disp, ex_items)}
+        mx_by_code = {c: mx for c, _, mx in ex_items}
+        label_by_code = {c: lab for c, lab, _ in ex_items}
+
+        # sélection affichée
+        cur_code = (self.manual_score_ex_var.get() or '').strip()
+        if cur_code not in mx_by_code:
+            cur_code = ex_items[0][0]
+        cur_disp = next((d for d in disp if code_by_disp.get(d) == cur_code), disp[0])
+
+        disp_var = tk.StringVar(value=cur_disp)
+        cb = ttk.Combobox(row1, state='readonly', values=disp, textvariable=disp_var, width=44)
+        cb.pack(side='left', padx=(8, 0), fill='x', expand=True)
+
+        # Points
+        row2 = ttk.Frame(frm)
+        row2.pack(fill='x', pady=(0, 8))
+        ttk.Label(row2, text='Points :').pack(side='left')
+
+        pts_var = tk.StringVar(value=(self.manual_score_pts_var.get() or ''))
+        if not pts_var.get().strip():
+            pts_var.set(f"{mx_by_code.get(cur_code, 0.0):g}")
+
+        ent = ttk.Entry(row2, textvariable=pts_var, width=10)
+        ent.pack(side='left', padx=(8, 0))
+
+        max_lbl_var = tk.StringVar(value=f"/ {mx_by_code.get(cur_code, 0.0):g}")
+        ttk.Label(row2, textvariable=max_lbl_var).pack(side='left', padx=6)
+
+        def _on_ex_change(_evt=None):
+            c = code_by_disp.get(disp_var.get(), ex_items[0][0])
+            try:
+                self.manual_score_ex_var.set(c)
+            except Exception:
+                pass
+            max_lbl_var.set(f"/ {mx_by_code.get(c, 0.0):g}")
+
+        cb.bind('<<ComboboxSelected>>', _on_ex_change)
+
+        # Boutons
+        btns = ttk.Frame(frm)
+        btns.pack(fill='x', pady=(10, 0))
+
+        result = {'ok': False}
+
+        def on_ok():
+            result['ok'] = True
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        def on_cancel():
+            result['ok'] = False
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text='Annuler', command=on_cancel).pack(side='right')
+        ttk.Button(btns, text='OK', command=on_ok).pack(side='right', padx=(0, 8))
+
+        try:
+            ent.focus_set()
+            ent.selection_range(0, 'end')
+        except Exception:
+            pass
+
+        self.root.wait_window(top)
+        if not result.get('ok'):
+            return
+
+        # Lecture valeurs
+        ex_code = code_by_disp.get(disp_var.get(), ex_items[0][0])
+        ex_label = label_by_code.get(ex_code, f"Exercice {ex_code}")
+
+        raw_pts = (pts_var.get() or '').strip().replace(',', '.')
+        try:
+            pts = float(raw_pts)
+        except Exception:
+            messagebox.showwarning('Points manuels', 'Valeur de points invalide.')
+            return
+
+        # mémorise pour la prochaine fois
+        try:
+            self.manual_score_ex_var.set(ex_code)
+        except Exception:
+            pass
+        try:
+            self.manual_score_pts_var.set(str(pts).replace('.', ','))
+        except Exception:
+            pass
+
+        # Ajout / remplacement
+        anns = self._annotations_for_current_doc()
+        kept = []
+        for a in anns:
+            if isinstance(a, dict) and a.get('kind') == 'manual_score':
+                c = str(a.get('exercise_code', '')).strip()
+                c = c.split('.', 1)[0] if c else ''
+                if c == ex_code:
+                    continue
+            kept.append(a)
+        anns[:] = kept
+
+        x_use = float(x_pt)
+        try:
+            # Si alignement marge actif (Correction V0), on verrouille X
+            if self._corr_align_margin_enabled():
+                x_use = float(self._corr_margin_x_pt())
+        except Exception:
+            pass
+
+        ann = {
+            'id': str(uuid.uuid4()),
+            'kind': 'manual_score',
+            'page': int(page_index),
+            'x_pt': float(x_use),
+            'y_pt': float(y_pt),
+            'exercise_code': str(ex_code),
+            'exercise_label': str(ex_label),
+            'points': float(pts),
+            'style': {
+                'radius_pt': 11.0,
+                'border': BASIC_COLORS.get('rouge', '#EF4444'),
+                'fill': '#FFFFFF',
+                'label_fontsize': 11.0,
+                'text_color': BASIC_COLORS.get('rouge', '#EF4444'),
+            },
+            'payload': {'tag': 'manual_score'},
+        }
+        anns.append(ann)
+
+        try:
+            self.project.save()
+        except Exception:
+            pass
+
+        try:
+            self._schedule_regenerate()
+        except Exception:
+            pass
+
+        # MAJ UI
+        try:
+            self._refresh_marks_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_correction_totals()
+        except Exception:
+            pass
+        try:
+            self._refresh_info_panel()
+        except Exception:
+            pass
+
     # ---------------- Helpers ----------------
 
     # ---------------- Helpers ----------------
@@ -2270,6 +3074,10 @@ class AppWindow:
         ann = self.project.settings.setdefault("annotations", {})
         self.project.settings.setdefault("pastille_label_style", "blue")
         self.project.settings.setdefault("corr_margin_cm", 0.5)
+        self.project.settings.setdefault('guide_overlay_selected', '')
+        self.project.settings.setdefault('guide_overlay_enabled', False)
+        self.project.settings.setdefault('guide_overlay_opacity50', True)
+        self.project.settings.setdefault('guide_overlay_opacity50', True)
         try:
             self.project.settings["corr_margin_cm"] = float(self._corr_margin_cm())
         except Exception:
@@ -2359,7 +3167,7 @@ class AppWindow:
             return
 
         self.project.current_doc_id = doc_id
-        self.viewer.open_pdf(view_abs)
+        self._open_pdf_with_optional_overlay(view_abs)
         try:
             self._update_margin_guide()
         except Exception:
@@ -2384,7 +3192,7 @@ class AppWindow:
         if not p.exists():
             messagebox.showwarning("Correction", "Le PDF corrigé est introuvable.")
             return
-        self.viewer.open_pdf(p)
+        self._open_pdf_with_optional_overlay(p)
         try:
             self._update_margin_guide()
         except Exception:
@@ -2410,6 +3218,8 @@ class AppWindow:
         except Exception:
             pass
         self.project.settings.setdefault("corr_margin_cm", 0.5)
+        self.project.settings.setdefault('guide_overlay_selected', '')
+        self.project.settings.setdefault('guide_overlay_enabled', False)
         try:
             self.c_align_margin_cm_var.set(str(self.project.settings.get("corr_margin_cm", 0.5)))
         except Exception:
@@ -2417,6 +3227,15 @@ class AppWindow:
         self.project.save()
 
         # recharge la bibliothèque d'images (outil Image)
+
+        # GuideCorrection overlays
+        try:
+            self._refresh_guide_overlay_list()
+            self.gc_overlay_select_var.set(str(self.project.settings.get('guide_overlay_selected', '') or ''))
+            self.gc_overlay_enabled_var.set(bool(self.project.settings.get('guide_overlay_enabled', False)))
+            self.gc_overlay_opacity50_var.set(bool(self.project.settings.get('guide_overlay_opacity50', True)))
+        except Exception:
+            pass
         try:
             self.image_tool.refresh_options()
         except Exception:
@@ -2452,6 +3271,9 @@ class AppWindow:
         except Exception:
             pass
         self.project.settings.setdefault("corr_margin_cm", 0.5)
+        self.project.settings.setdefault('guide_overlay_selected', '')
+        self.project.settings.setdefault('guide_overlay_enabled', False)
+        self.project.settings.setdefault('guide_overlay_opacity50', True)
         try:
             self.c_align_margin_cm_var.set(str(self.project.settings.get("corr_margin_cm", 0.5)))
         except Exception:
@@ -2459,6 +3281,15 @@ class AppWindow:
         self.project.save()
 
         # recharge la bibliothèque d'images (outil Image)
+
+        # GuideCorrection overlays
+        try:
+            self._refresh_guide_overlay_list()
+            self.gc_overlay_select_var.set(str(self.project.settings.get('guide_overlay_selected', '') or ''))
+            self.gc_overlay_enabled_var.set(bool(self.project.settings.get('guide_overlay_enabled', False)))
+            self.gc_overlay_opacity50_var.set(bool(self.project.settings.get('guide_overlay_opacity50', True)))
+        except Exception:
+            pass
         try:
             self.image_tool.refresh_options()
         except Exception:
@@ -2486,7 +3317,18 @@ class AppWindow:
         self.project.settings.setdefault("annotations", {})
         self.project.settings.setdefault("pastille_label_style", "blue")
         # Distance d'alignement dans la marge (Correction V0)
+        # GuideCorrection : persiste la sélection / activation
+        try:
+            self.project.settings['guide_overlay_selected'] = str(self.gc_overlay_select_var.get() or '')
+            self.project.settings['guide_overlay_enabled'] = bool(self.gc_overlay_enabled_var.get())
+            self.project.settings['guide_overlay_opacity50'] = bool(self.gc_overlay_opacity50_var.get())
+        except Exception:
+            pass
+
         self.project.settings.setdefault("corr_margin_cm", 0.5)
+        self.project.settings.setdefault('guide_overlay_selected', '')
+        self.project.settings.setdefault('guide_overlay_enabled', False)
+        self.project.settings.setdefault('guide_overlay_opacity50', True)
         try:
             self.project.settings["corr_margin_cm"] = float(self._corr_margin_cm())
         except Exception:
@@ -3096,26 +3938,367 @@ class AppWindow:
         pts = points_for(scheme, code, result)
         self.c_points_lbl.configure(text=f"Points : {pts:g}")
 
+
     def _refresh_marks_list(self) -> None:
+        """Rafraîchit la liste 'Marques du document' (Correction V0).
+
+        On liste :
+        - pastilles (score_circle)
+        - points manuels par exercice (manual_score)
+
+        Un mapping (index listbox -> index annotation) est conservé pour permettre
+        la suppression depuis cette liste.
+        """
+        if not hasattr(self, 'c_marks'):
+            return
         self.c_marks.delete(0, tk.END)
+        self._marks_list_map = []
+
         if not self.project:
             return
         doc = self.project.get_current_doc()
         if not doc:
             return
+
+        # Max par exercice principal (pour afficher /max sur les points manuels)
+        max_by_ex: dict[str, float] = {}
+        try:
+            scheme = self._scheme()
+
+            def total_good(node) -> float:
+                if getattr(node, 'children', None):
+                    return float(sum(total_good(c) for c in node.children))
+                try:
+                    lvl = int(node.level())
+                except Exception:
+                    lvl = 0
+                if lvl in (1, 2):
+                    rub = getattr(node, 'rubric', None)
+                    if rub is not None:
+                        try:
+                            return float(rub.good)
+                        except Exception:
+                            return 1.0
+                    return 1.0
+                return 0.0
+
+            for ex in getattr(scheme, 'exercises', []) or []:
+                try:
+                    ex_code = str(ex.code)
+                except Exception:
+                    continue
+                max_by_ex[ex_code] = float(total_good(ex))
+        except Exception:
+            max_by_ex = {}
+
         anns = self._annotations_for_current_doc()
-        for a in anns:
-            if a.get("kind") != "score_circle":
+        for i, a in enumerate(anns):
+            if not isinstance(a, dict):
                 continue
-            code = a.get("exercise_code", "?")
-            label = a.get("exercise_label") or ""
-            res = a.get("result", "?")
-            pts = float(a.get("points", 0.0))
-            page = int(a.get("page", 0))
-            if label:
-                self.c_marks.insert(tk.END, f"p{page+1} • {code} • {label} • {res} • {pts:g}")
-            else:
-                self.c_marks.insert(tk.END, f"p{page+1} • {code} • {res} • {pts:g}")
+            kind = a.get('kind')
+
+            if kind == 'score_circle':
+                code = a.get('exercise_code', '?')
+                label = a.get('exercise_label') or ''
+                res = a.get('result', '?')
+                try:
+                    pts = float(a.get('points', 0.0))
+                except Exception:
+                    pts = 0.0
+                page = int(a.get('page', 0))
+                if label:
+                    self.c_marks.insert(tk.END, f"p{page+1} • {code} • {label} • {res} • {pts:g}")
+                else:
+                    self.c_marks.insert(tk.END, f"p{page+1} • {code} • {res} • {pts:g}")
+                self._marks_list_map.append(i)
+
+            elif kind == 'manual_score':
+                code = str(a.get('exercise_code', '') or '').strip()
+                if code:
+                    code = code.split('.', 1)[0]
+                label = a.get('exercise_label') or (f"Exercice {code}" if code else 'Exercice')
+                try:
+                    pts = float(a.get('points', 0.0))
+                except Exception:
+                    pts = 0.0
+                page = int(a.get('page', 0))
+                mx = float(max_by_ex.get(code, 0.0)) if code else 0.0
+                if mx > 0:
+                    self.c_marks.insert(tk.END, f"p{page+1} • Ex {code} • {label} • MANUEL • {pts:g}/{mx:g}")
+                else:
+                    self.c_marks.insert(tk.END, f"p{page+1} • Ex {code} • {label} • MANUEL • {pts:g}")
+                self._marks_list_map.append(i)
+
+    def _on_marks_double_click(self, event=None) -> None:
+        """Double-clic dans la liste 'Marques du document'.
+
+        Amélioration confort :
+        - si la ligne correspond à un marqueur de points manuels (kind='manual_score'),
+          on ré-ouvre la fenêtre d'édition pour modifier les points (et éventuellement l'exercice).
+        """
+        if not hasattr(self, 'c_marks'):
+            return
+        if not self._require_doc():
+            return
+
+        try:
+            lb_index = None
+            if event is not None:
+                try:
+                    lb_index = int(self.c_marks.nearest(event.y))
+                except Exception:
+                    lb_index = None
+            if lb_index is None:
+                sel = self.c_marks.curselection()
+                if not sel:
+                    return
+                lb_index = int(sel[0])
+        except Exception:
+            return
+
+        try:
+            if lb_index < 0 or lb_index >= len(getattr(self, '_marks_list_map', [])):
+                return
+            ann_index = int(self._marks_list_map[lb_index])
+        except Exception:
+            return
+
+        anns = self._annotations_for_current_doc()
+        if ann_index < 0 or ann_index >= len(anns):
+            try:
+                self._refresh_marks_list()
+            except Exception:
+                pass
+            return
+
+        a = anns[ann_index]
+        if not isinstance(a, dict) or a.get('kind') != 'manual_score':
+            return
+
+        self._edit_manual_score_at_index(ann_index)
+
+    def _edit_manual_score_at_index(self, ann_index: int) -> None:
+        """Édite un marqueur 'manual_score' existant (points manuels) via une fenêtre.
+
+        Conserve la position (page/x/y). Assure l'unicité : un seul 'manual_score' par exercice principal.
+        """
+        if not self._require_doc():
+            return
+        assert self.project is not None
+        doc = self.project.get_current_doc()
+        if not doc:
+            return
+
+        anns = self._annotations_for_current_doc()
+        if ann_index < 0 or ann_index >= len(anns):
+            return
+
+        cur = anns[ann_index]
+        if not isinstance(cur, dict) or cur.get('kind') != 'manual_score':
+            return
+
+        scheme = self._scheme()
+        if not getattr(scheme, 'exercises', None):
+            messagebox.showwarning('Points manuels', "Aucun exercice défini dans l'onglet Notation.")
+            return
+
+        # Max points par exercice principal (même logique que _add_manual_score_at)
+        def total_good(node) -> float:
+            if getattr(node, 'children', None):
+                return float(sum(total_good(c) for c in node.children))
+            try:
+                lvl = int(node.level())
+            except Exception:
+                lvl = 0
+            if lvl in (1, 2):
+                rub = getattr(node, 'rubric', None)
+                if rub is not None:
+                    try:
+                        return float(rub.good)
+                    except Exception:
+                        return 1.0
+                return 1.0
+            return 0.0
+
+        ex_items = []  # (code, label, max)
+        for ex in scheme.exercises:
+            try:
+                code = str(ex.code)
+            except Exception:
+                continue
+            label = str(ex.label) if getattr(ex, 'label', None) else f"Exercice {code}"
+            mx = float(total_good(ex))
+            ex_items.append((code, label, mx))
+
+        if not ex_items:
+            messagebox.showwarning('Points manuels', "Aucun exercice défini dans l'onglet Notation.")
+            return
+
+        # Valeurs courantes
+        cur_code = str(cur.get('exercise_code', '') or '').strip()
+        if cur_code:
+            cur_code = cur_code.split('.', 1)[0]
+        try:
+            cur_pts = float(cur.get('points', 0.0))
+        except Exception:
+            cur_pts = 0.0
+
+        # --- UI dialog ---
+        top = tk.Toplevel(self.root)
+        top.title('Modifier points manuels (exercice)')
+        top.transient(self.root)
+        top.grab_set()
+
+        frm = ttk.Frame(top, padding=12)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text='Modifier des points manuels (par exercice principal)').pack(anchor='w')
+        ttk.Label(frm, text="Ces points remplacent le total des pastilles de l'exercice dans la note.").pack(anchor='w', pady=(2, 10))
+
+        # Exercice
+        row1 = ttk.Frame(frm)
+        row1.pack(fill='x', pady=(0, 8))
+        ttk.Label(row1, text='Exercice :').pack(side='left')
+
+        disp = [f"Ex {c} — {lab} (max {mx:g})" for c, lab, mx in ex_items]
+        code_by_disp = {d: c for d, (c, _, _) in zip(disp, ex_items)}
+        mx_by_code = {c: mx for c, _, mx in ex_items}
+        label_by_code = {c: lab for c, lab, _ in ex_items}
+
+        if cur_code not in mx_by_code:
+            cur_code = ex_items[0][0]
+        cur_disp = next((d for d in disp if code_by_disp.get(d) == cur_code), disp[0])
+
+        disp_var = tk.StringVar(value=cur_disp)
+        cb = ttk.Combobox(row1, state='readonly', values=disp, textvariable=disp_var, width=44)
+        cb.pack(side='left', padx=(8, 0), fill='x', expand=True)
+
+        # Points
+        row2 = ttk.Frame(frm)
+        row2.pack(fill='x', pady=(0, 8))
+        ttk.Label(row2, text='Points :').pack(side='left')
+
+        pts_var = tk.StringVar(value=str(cur_pts).replace('.', ','))
+        ent = ttk.Entry(row2, textvariable=pts_var, width=10)
+        ent.pack(side='left', padx=(8, 0))
+
+        max_lbl_var = tk.StringVar(value=f"/ {mx_by_code.get(cur_code, 0.0):g}")
+        ttk.Label(row2, textvariable=max_lbl_var).pack(side='left', padx=6)
+
+        def _on_ex_change(_evt=None):
+            c = code_by_disp.get(disp_var.get(), ex_items[0][0])
+            try:
+                self.manual_score_ex_var.set(c)
+            except Exception:
+                pass
+            max_lbl_var.set(f"/ {mx_by_code.get(c, 0.0):g}")
+
+        cb.bind('<<ComboboxSelected>>', _on_ex_change)
+
+        # Boutons
+        btns = ttk.Frame(frm)
+        btns.pack(fill='x', pady=(10, 0))
+
+        result = {'ok': False}
+
+        def on_ok():
+            result['ok'] = True
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        def on_cancel():
+            result['ok'] = False
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text='Annuler', command=on_cancel).pack(side='right')
+        ttk.Button(btns, text='OK', command=on_ok).pack(side='right', padx=(0, 8))
+
+        try:
+            ent.focus_set()
+            ent.selection_range(0, 'end')
+        except Exception:
+            pass
+
+        self.root.wait_window(top)
+        if not result.get('ok'):
+            return
+
+        # Lecture valeurs
+        ex_code = code_by_disp.get(disp_var.get(), ex_items[0][0])
+        ex_label = label_by_code.get(ex_code, f"Exercice {ex_code}")
+
+        raw_pts = (pts_var.get() or '').strip().replace(',', '.')
+        try:
+            pts = float(raw_pts)
+        except Exception:
+            messagebox.showwarning('Points manuels', 'Valeur de points invalide.')
+            return
+
+        # mémorise pour la prochaine fois
+        try:
+            self.manual_score_ex_var.set(ex_code)
+        except Exception:
+            pass
+        try:
+            self.manual_score_pts_var.set(str(pts).replace('.', ','))
+        except Exception:
+            pass
+
+        # Mise à jour du marqueur (position conservée)
+        cur['exercise_code'] = str(ex_code)
+        cur['exercise_label'] = str(ex_label)
+        cur['points'] = float(pts)
+
+        # Assure payload/tag
+        pl = cur.get('payload')
+        if not isinstance(pl, dict):
+            pl = {}
+        pl['tag'] = 'manual_score'
+        cur['payload'] = pl
+
+        # Unicité : supprime d'éventuels autres 'manual_score' du même exercice (hors celui-ci)
+        new_anns = []
+        for i, a in enumerate(anns):
+            if i == ann_index:
+                new_anns.append(cur)
+                continue
+            if isinstance(a, dict) and a.get('kind') == 'manual_score':
+                c = str(a.get('exercise_code', '') or '').strip()
+                c = c.split('.', 1)[0] if c else ''
+                if c == ex_code:
+                    continue
+            new_anns.append(a)
+        anns[:] = new_anns
+
+        try:
+            self.project.save()
+        except Exception:
+            pass
+
+        try:
+            self._schedule_regenerate()
+        except Exception:
+            pass
+
+        # MAJ UI
+        try:
+            self._refresh_marks_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_correction_totals()
+        except Exception:
+            pass
+        try:
+            self._refresh_info_panel()
+        except Exception:
+            pass
+
 
 
     def _scheme_max_total(self) -> float:
@@ -3134,7 +4317,15 @@ class AppWindow:
 
         return float(sum(total_good(ex) for ex in scheme.exercises))
 
+
     def _doc_attrib_total(self) -> float:
+        """Total des points attribués au document courant.
+
+        Règle :
+        - par défaut on additionne les pastilles (score_circle)
+        - si un marqueur 'manual_score' existe pour un exercice principal, il **remplace**
+          le total des pastilles de cet exercice dans la note.
+        """
         if not self.project:
             return 0.0
         doc = self.project.get_current_doc()
@@ -3142,14 +4333,44 @@ class AppWindow:
             return 0.0
         ann = self.project.settings.get("annotations", {})
         anns = ann.get(doc.id, []) if isinstance(ann, dict) else []
+        if not isinstance(anns, list):
+            return 0.0
+
+        sum_by_ex: dict[str, float] = {}
+        manual_by_ex: dict[str, float] = {}
+
+        for a in anns:
+            if not isinstance(a, dict):
+                continue
+            kind = a.get('kind')
+            if kind == 'score_circle':
+                code = str(a.get('exercise_code', '') or '').strip()
+                if not code:
+                    continue
+                ex_code = code.split('.', 1)[0]
+                try:
+                    pts = float(a.get('points', 0.0))
+                except Exception:
+                    pts = 0.0
+                sum_by_ex[ex_code] = sum_by_ex.get(ex_code, 0.0) + float(pts)
+            elif kind == 'manual_score':
+                code = str(a.get('exercise_code', '') or '').strip()
+                if not code:
+                    continue
+                ex_code = code.split('.', 1)[0]
+                try:
+                    pts = float(a.get('points', 0.0))
+                except Exception:
+                    pts = 0.0
+                manual_by_ex[ex_code] = float(pts)
+
         total = 0.0
-        if isinstance(anns, list):
-            for a in anns:
-                if isinstance(a, dict) and a.get("kind") == "score_circle":
-                    try:
-                        total += float(a.get("points", 0.0))
-                    except Exception:
-                        pass
+        all_ex = set(sum_by_ex.keys()) | set(manual_by_ex.keys())
+        for ex_code in all_ex:
+            if ex_code in manual_by_ex:
+                total += float(manual_by_ex.get(ex_code, 0.0))
+            else:
+                total += float(sum_by_ex.get(ex_code, 0.0))
         return float(total)
 
     def _refresh_correction_totals(self) -> None:
@@ -3161,6 +4382,7 @@ class AppWindow:
         attrib = self._doc_attrib_total()
         mx = self._scheme_max_total()
         self.c_total_var.set(f"Total attribué : {attrib:g} / {mx:g}")
+
     def _corr_align_margin_enabled(self) -> bool:
         try:
             return bool(getattr(self, "c_align_margin_var", None).get())
@@ -3544,7 +4766,7 @@ class AppWindow:
         # Rafraîchissement robuste (important en version packagée .exe : les exceptions Tk peuvent être silencieuses)
         def _open_corrected_after_regen():
             try:
-                self.viewer.open_pdf(out_pdf, preserve_view=True, lazy_render=True)
+                self._open_pdf_with_optional_overlay(out_pdf, preserve_view=True, lazy_render=True)
                 try:
                     self._update_margin_guide()
                 except Exception:
@@ -3555,7 +4777,7 @@ class AppWindow:
                     pass
             except TypeError:
                 # Compat avec d'anciennes versions de PDFViewer.open_pdf(pdf_path)
-                self.viewer.open_pdf(out_pdf)
+                self._open_pdf_with_optional_overlay(out_pdf)
                 try:
                     self._update_margin_guide()
                 except Exception:
@@ -3567,7 +4789,7 @@ class AppWindow:
             except Exception:
                 # dernier recours : retenter un peu plus tard (écriture fichier / cache OS)
                 try:
-                    self.root.after(80, lambda: self.viewer.open_pdf(out_pdf, preserve_view=True, lazy_render=True))
+                    self.root.after(80, lambda: self._open_pdf_with_optional_overlay(out_pdf, preserve_view=True, lazy_render=True))
                 except Exception:
                     pass
         # Laisse Tk finir le callback (menu/context) avant de re-render le canvas
@@ -3591,23 +4813,52 @@ class AppWindow:
         self._refresh_info_panel()
 
     def c_delete_selected(self) -> None:
+        """Supprime la marque sélectionnée dans la liste Correction V0.
+
+        Supporte :
+        - pastilles (score_circle)
+        - points manuels (manual_score)
+        """
         if not self._require_doc():
             return
         sel = self.c_marks.curselection()
         if not sel:
             return
-        idx = sel[0]
+        idx = int(sel[0])
+
         anns = self._annotations_for_current_doc()
-        score_idxs = [i for i, a in enumerate(anns) if a.get("kind") == "score_circle"]
-        if idx < 0 or idx >= len(score_idxs):
+
+        # Mapping listbox -> index annotation (créé dans _refresh_marks_list)
+        mapping = getattr(self, '_marks_list_map', None)
+        ann_idx = None
+        if isinstance(mapping, list) and 0 <= idx < len(mapping):
+            try:
+                ann_idx = int(mapping[idx])
+            except Exception:
+                ann_idx = None
+
+        # Fallback (ancienne logique) : uniquement pastilles
+        if ann_idx is None:
+            score_idxs = [i for i, a in enumerate(anns) if isinstance(a, dict) and a.get('kind') == 'score_circle']
+            if idx < 0 or idx >= len(score_idxs):
+                return
+            ann_idx = score_idxs[idx]
+
+        if ann_idx is None or ann_idx < 0 or ann_idx >= len(anns):
             return
-        del anns[score_idxs[idx]]
+
+        try:
+            del anns[ann_idx]
+        except Exception:
+            return
+
         assert self.project is not None
         self.project.save()
         self.c_regenerate()
         self._refresh_marks_list()
         self._refresh_files_list()
         self._refresh_info_panel()
+        self._refresh_correction_totals()
 
     # ---------------- Infos : points attribués / max ----------------
 
@@ -3678,6 +4929,24 @@ class AppWindow:
                 pts = 0.0
             attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
 
+        # Points manuels: remplace le total des pastilles pour l'exercice principal
+        manual_set: set[str] = set()
+        for a in anns:
+            if not isinstance(a, dict) or a.get("kind") != "manual_score":
+                continue
+            code = str(a.get("exercise_code", "")).strip()
+            if not code:
+                continue
+            ex_code = code.split(".", 1)[0]
+            if ex_code not in attrib_by_ex:
+                continue
+            try:
+                pts = float(a.get("points", 0.0))
+            except Exception:
+                pts = 0.0
+            attrib_by_ex[ex_code] = float(pts)
+            manual_set.add(ex_code)
+
         def sort_key_ex(s: str):
             try:
                 return (0, int(s))
@@ -3693,7 +4962,10 @@ class AppWindow:
             mx = float(max_by_ex.get(ex_code, 0.0))
             at = float(attrib_by_ex.get(ex_code, 0.0))
             # format compact (préserve la largeur de la marge)
-            lines.append(f"Ex {ex_code} : {at:g}/{mx:g}")
+            prefix = f"Ex {ex_code}"
+            if 'manual_set' in locals() and ex_code in manual_set:
+                prefix = f"{prefix} (M)"
+            lines.append(f"{prefix} : {at:g}/{mx:g}")
 
         lines.append("")
         lines.append(f"Total : {attrib_total:g}/{max_total:g}")
@@ -3945,6 +5217,27 @@ class AppWindow:
                     pts = 0.0
                 attrib_by_ex[ex_code] = attrib_by_ex.get(ex_code, 0.0) + pts
 
+        # Points manuels: remplace le total des pastilles pour l'exercice principal
+        manual_set: set[str] = set()
+        if isinstance(anns, list):
+            for a in anns:
+                if not isinstance(a, dict):
+                    continue
+                if a.get("kind") != "manual_score":
+                    continue
+                code = str(a.get("exercise_code", "")).strip()
+                if not code:
+                    continue
+                ex_code = code.split(".", 1)[0]
+                if ex_code not in max_by_ex:
+                    continue
+                try:
+                    pts = float(a.get("points", 0.0))
+                except Exception:
+                    pts = 0.0
+                attrib_by_ex[ex_code] = float(pts)
+                manual_set.add(ex_code)
+
         attrib_total = sum(attrib_by_ex.values())
 
         def sort_key_ex(s: str):
@@ -3956,7 +5249,10 @@ class AppWindow:
         for ex_code in sorted(max_by_ex.keys(), key=sort_key_ex):
             attrib = attrib_by_ex.get(ex_code, 0.0)
             mx = max_by_ex.get(ex_code, 0.0)
-            self.info_tree.insert("", "end", text=label_by_ex.get(ex_code, f"Exercice {ex_code}"),
+            base_label = label_by_ex.get(ex_code, f"Exercice {ex_code}")
+            if 'manual_set' in locals() and ex_code in manual_set:
+                base_label = f"{base_label} (manuel)"
+            self.info_tree.insert("", "end", text=base_label,
                                   values=(f"{attrib:g}", f"{mx:g}"))
 
         self.info_total_var.set(f"{attrib_total:g} / {max_total:g}")
