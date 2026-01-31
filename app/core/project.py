@@ -159,6 +159,9 @@ class Project:
         self.settings.setdefault("left_margin_cm", 5.0)
         self.settings.setdefault("owner_password", "owner")
         self.settings.setdefault("annotations", {})
+        self.settings.setdefault("image_library", [])
+        # catégories pour la bibliothèque d'images PNG
+        self.settings.setdefault("image_categories", ["Général"])
         # grading_scheme is handled in app_window via ensure_scheme_dict
 
     @classmethod
@@ -174,6 +177,10 @@ class Project:
         prj.inputs_dir.mkdir(parents=True, exist_ok=True)
         prj.work_dir.mkdir(parents=True, exist_ok=True)
         prj.exports_dir.mkdir(parents=True, exist_ok=True)
+
+        # Dossier images (PNG) : créé dès la création du projet pour éviter les surprises.
+        # (Utilisé par l'outil "Image (PNG)".)
+        (prj.root_dir / "assets" / "images").mkdir(parents=True, exist_ok=True)
 
         prj.save()
         return prj
@@ -206,6 +213,9 @@ class Project:
         prj = cls.from_dict(data)
         prj.root_dir = path.parent.resolve()
         prj._ensure_defaults()
+
+        # Dossier images (PNG) : assure son existence pour les anciens projets.
+        (prj.root_dir / "assets" / "images").mkdir(parents=True, exist_ok=True)
 
         # Autocorrection : si documents vides, on tente de reconstruire
         if not prj.documents:
