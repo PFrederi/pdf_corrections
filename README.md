@@ -1,9 +1,13 @@
 # Corrections PDF — Projets (Tkinter)
 
+<<<<<<< HEAD
 **Version : v0.7.12**
 
 - Import / Projet : suppression d’un PDF du projet avec confirmation (supprime aussi variantes + marques associées).
 - Correctif : évite l’erreur Tk ‘No more menus can be allocated’ lors des clics droits répétés.
+=======
+**Version : v0.7.8**
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
 
 Fonctions :
 

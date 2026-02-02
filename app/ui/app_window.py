@@ -96,6 +96,9 @@ from app.core.grading import (
 
 
 APP_VERSION = "0.7.12"
+=======
+APP_VERSION = "0.7.8"
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
 
 
 class AppWindow:
@@ -610,9 +613,15 @@ class AppWindow:
         margin_row.pack(anchor="w", pady=(0, 10))
         ttk.Label(margin_row, text="Distance marge (cm) :").pack(side="left")
         try:
+<<<<<<< HEAD
             spin = ttk.Spinbox(margin_row, from_=0.0, to=9999.0, increment=0.1, width=6, textvariable=self.c_align_margin_cm_var, command=self._apply_corr_margin_cm)
         except Exception:
             spin = tk.Spinbox(margin_row, from_=0.0, to=9999.0, increment=0.1, width=6, textvariable=self.c_align_margin_cm_var, command=self._apply_corr_margin_cm)
+=======
+            spin = ttk.Spinbox(margin_row, from_=0.0, to=10.0, increment=0.1, width=6, textvariable=self.c_align_margin_cm_var, command=self._apply_corr_margin_cm)
+        except Exception:
+            spin = tk.Spinbox(margin_row, from_=0.0, to=10.0, increment=0.1, width=6, textvariable=self.c_align_margin_cm_var, command=self._apply_corr_margin_cm)
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
         spin.pack(side="left", padx=(6, 0))
         try:
             spin.bind("<Return>", self._apply_corr_margin_cm)
@@ -2509,6 +2518,10 @@ class AppWindow:
 
             orig = self._move_snapshot
             kind = orig.get("kind") if isinstance(orig, dict) else None
+<<<<<<< HEAD
+=======
+
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
             if kind in ("score_circle", "manual_score"):
                 # Option "Aligner dans la marge" (Correction V0) : verrouille X à la distance choisie du bord gauche
                 cx = float(orig.get("x_pt", 0.0)) + dx
@@ -2518,11 +2531,15 @@ class AppWindow:
                 except Exception:
                     sub = ""
                 if sub == "Correction V0" and self._corr_align_margin_enabled():
+<<<<<<< HEAD
                     try:
                         rad = float((orig.get("style") or {}).get("radius_pt", 0.0) or 0.0)
                     except Exception:
                         rad = 0.0
                     target["x_pt"] = float(self._corr_margin_x_pt(page_index, radius_pt=rad))
+=======
+                    target["x_pt"] = float(self._corr_margin_x_pt())
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                 else:
                     target["x_pt"] = cx
                 target["y_pt"] = cy
@@ -2542,12 +2559,17 @@ class AppWindow:
             if kind == "image":
                 rect = orig.get("rect")
                 if isinstance(rect, (list, tuple)) and len(rect) == 4:
+<<<<<<< HEAD
                     new_rect = [
+=======
+                    target["rect"] = [
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                         float(rect[0]) + dx,
                         float(rect[1]) + dy,
                         float(rect[2]) + dx,
                         float(rect[3]) + dy,
                     ]
+<<<<<<< HEAD
                     try:
                         sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
                     except Exception:
@@ -2555,6 +2577,8 @@ class AppWindow:
                     if sub == "Correction V0" and self._corr_align_margin_enabled():
                         new_rect = self._align_image_rect_center_to_margin(page_index, new_rect)
                     target["rect"] = new_rect
+=======
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                 return
 
             if kind == "arrow":
@@ -2622,6 +2646,7 @@ class AppWindow:
                     try:
                         anns = self._annotations_for_current_doc()
                         for a in anns:
+<<<<<<< HEAD
                             if not (isinstance(a, dict) and str(a.get("id", "")) == str(self._move_ann_id)):
                                 continue
                             pi = int(a.get("page", page_index))
@@ -2638,6 +2663,11 @@ class AppWindow:
                                 if isinstance(rect, (list, tuple)) and len(rect) == 4:
                                     a["rect"] = self._align_image_rect_center_to_margin(pi, rect)
                             break
+=======
+                            if isinstance(a, dict) and str(a.get("id", "")) == str(self._move_ann_id) and a.get("kind") == "score_circle":
+                                a["x_pt"] = float(self._corr_margin_x_pt())
+                                break
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                     except Exception:
                         pass
 
@@ -2728,6 +2758,7 @@ class AppWindow:
                         messagebox.showwarning("Image", "Aucune image sélectionnée (ou bibliothèque vide).")
                         return
 
+<<<<<<< HEAD
                     try:
                         sub = self.view_subtabs.tab(self.view_subtabs.select(), "text")
                     except Exception:
@@ -2740,6 +2771,8 @@ class AppWindow:
                         except Exception:
                             pass
 
+=======
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                     anns.append(ann)
                     assert self.project is not None
                     self.project.save()
@@ -3027,7 +3060,11 @@ class AppWindow:
         try:
             # Si alignement marge actif (Correction V0), on verrouille X
             if self._corr_align_margin_enabled():
+<<<<<<< HEAD
                 x_use = float(self._corr_margin_x_pt(page_index, radius_pt=11.0))
+=======
+                x_use = float(self._corr_margin_x_pt())
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
         except Exception:
             pass
 
@@ -3452,6 +3489,7 @@ class AppWindow:
             zoom = 1.0
 
         # X en pixels : distance choisie depuis le bord gauche (points -> pixels via zoom)
+<<<<<<< HEAD
         for info in layout:
             try:
                 pi = int(info.get("page_index", 0))
@@ -3462,6 +3500,15 @@ class AppWindow:
             except Exception:
                 continue
             try:
+=======
+        try:
+            x_px = float(self._corr_margin_x_pt()) * zoom
+        except Exception:
+            return
+
+        for info in layout:
+            try:
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                 y0 = float(info.get("y0", 0.0))
                 y1 = y0 + float(info.get("h_px", 0.0))
             except Exception:
@@ -4531,6 +4578,11 @@ class AppWindow:
             cm = float(default)
         if cm < 0.0:
             cm = 0.0
+<<<<<<< HEAD
+=======
+        if cm > 10.0:
+            cm = 10.0
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
         return float(cm)
 
     def _apply_corr_margin_cm(self, *_evt) -> None:
@@ -4552,6 +4604,7 @@ class AppWindow:
             self._update_margin_guide()
         except Exception:
             pass
+<<<<<<< HEAD
     def _page_width_pt(self, page_index: int | None = None) -> float | None:
         """Largeur (en points PDF) de la page demandée (viewer courant).
 
@@ -4672,6 +4725,13 @@ class AppWindow:
         cm = self._corr_margin_cm()
         x_pt = float((cm / 2.54) * 72.0)
         return float(self._clamp_x_pt_to_page(page_index, x_pt, radius_pt=radius_pt))
+=======
+
+    def _corr_margin_x_pt(self) -> float:
+        """X (en points PDF) pour aligner une pastille à la distance choisie dans la marge."""
+        cm = self._corr_margin_cm()
+        return float((cm / 2.54) * 72.0)
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
 
 
     def _find_nearest_marker(self, page_index: int, x_pt: float, y_pt: float, threshold_pt: float = 14.0):
@@ -4750,7 +4810,11 @@ class AppWindow:
             "id": str(uuid.uuid4()),
             "kind": "score_circle",
             "page": int(page_index),
+<<<<<<< HEAD
             "x_pt": float(self._corr_margin_x_pt(page_index, radius_pt=9.0) if self._corr_align_margin_enabled() else x_pt),
+=======
+            "x_pt": float(self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt),
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
             "y_pt": float(y_pt),
             "exercise_code": code,
             "exercise_label": label,
@@ -4795,7 +4859,11 @@ class AppWindow:
         if int(ann.get("page", -1)) != int(page_index):
             return
 
+<<<<<<< HEAD
         x_use = self._corr_margin_x_pt(page_index, radius_pt=9.0) if self._corr_align_margin_enabled() else x_pt
+=======
+        x_use = self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
 
 
         ann["x_pt"] = float(x_use)
@@ -4817,7 +4885,11 @@ class AppWindow:
             if idx is not None and 0 <= idx < len(anns):
                 ann = anns[idx]
                 if isinstance(ann, dict) and ann.get("kind") == "score_circle":
+<<<<<<< HEAD
                     x_use = self._corr_margin_x_pt(page_index, radius_pt=9.0) if self._corr_align_margin_enabled() else x_pt
+=======
+                    x_use = self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
                     ann["page"] = int(page_index)
                     ann["x_pt"] = float(x_use)
                     ann["y_pt"] = float(y_pt)
@@ -4851,7 +4923,11 @@ class AppWindow:
             "id": str(uuid.uuid4()),
             "kind": "score_circle",
             "page": int(page_index),
+<<<<<<< HEAD
             "x_pt": float(self._corr_margin_x_pt(page_index, radius_pt=9.0) if self._corr_align_margin_enabled() else x_pt),
+=======
+            "x_pt": float(self._corr_margin_x_pt() if self._corr_align_margin_enabled() else x_pt),
+>>>>>>> 6f30ad2c70120348bfa3241d6c4cf59172ba1549
             "y_pt": float(y_pt),
             "exercise_code": code,
             "exercise_label": label or code,
