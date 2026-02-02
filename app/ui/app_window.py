@@ -95,6 +95,7 @@ from app.core.grading import (
 )
 
 
+<<<<<<< HEAD
 APP_VERSION = "0.7.12"
 =======
 APP_VERSION = "0.7.8"
