@@ -159,6 +159,9 @@ class Project:
         self.settings.setdefault("left_margin_cm", 5.0)
         self.settings.setdefault("owner_password", "owner")
         self.settings.setdefault("annotations", {})
+        self.settings.setdefault("image_library", [])
+        # catégories pour la bibliothèque d'images PNG
+        self.settings.setdefault("image_categories", ["Général"])
         # grading_scheme is handled in app_window via ensure_scheme_dict
 
     @classmethod
@@ -174,6 +177,10 @@ class Project:
         prj.inputs_dir.mkdir(parents=True, exist_ok=True)
         prj.work_dir.mkdir(parents=True, exist_ok=True)
         prj.exports_dir.mkdir(parents=True, exist_ok=True)
+
+        # Dossier images (PNG) : créé dès la création du projet pour éviter les surprises.
+        # (Utilisé par l'outil "Image (PNG)".)
+        (prj.root_dir / "assets" / "images").mkdir(parents=True, exist_ok=True)
 
         prj.save()
         return prj
@@ -206,6 +213,9 @@ class Project:
         prj = cls.from_dict(data)
         prj.root_dir = path.parent.resolve()
         prj._ensure_defaults()
+
+        # Dossier images (PNG) : assure son existence pour les anciens projets.
+        (prj.root_dir / "assets" / "images").mkdir(parents=True, exist_ok=True)
 
         # Autocorrection : si documents vides, on tente de reconstruire
         if not prj.documents:
@@ -365,6 +375,72 @@ class Project:
             if d.id == doc_id:
                 return d
         raise KeyError(f"Document introuvable: {doc_id}")
+
+    def delete_document(self, doc_id: str, *, delete_files: bool = True, delete_work_prefix: bool = True) -> bool:
+        """Supprime un document du projet.
+
+        - delete_files : supprime le PDF dans inputs/ + toutes les variantes référencées (marge/corrigé/etc.)
+        - delete_work_prefix : supprime aussi les fichiers work/ qui commencent par "<doc_id>__" (caches)
+        """
+
+        doc: Optional[Document] = None
+        for d in self.documents:
+            if d.id == doc_id:
+                doc = d
+                break
+        if doc is None:
+            return False
+
+        if delete_files:
+            paths: set[Path] = set()
+
+            def _add_rel(rel: str) -> None:
+                if not rel:
+                    return
+                p = self.rel_to_abs(rel)
+                # sécurité : ne jamais supprimer en dehors du dossier projet
+                try:
+                    p.relative_to(self.root_dir.resolve())
+                except Exception:
+                    return
+                paths.add(p)
+
+            _add_rel(doc.input_rel)
+            for rel in (doc.variants or {}).values():
+                _add_rel(rel)
+
+            if delete_work_prefix:
+                try:
+                    for p in self.work_dir.glob(f"{doc_id}__*"):
+                        if p.is_file():
+                            paths.add(p.resolve())
+                except Exception:
+                    pass
+
+            # suppression (ignore erreurs, ex: fichier déjà supprimé)
+            for p in sorted(paths, key=lambda x: str(x)):
+                try:
+                    if p.exists() and p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+
+        # supprime les marques/annotations associées
+        ann = self.settings.get("annotations")
+        if isinstance(ann, dict):
+            ann.pop(doc_id, None)
+
+        # retire de la liste documents
+        self.documents = [d for d in self.documents if d.id != doc_id]
+
+        # current_doc_id valide
+        if self.current_doc_id == doc_id:
+            self.current_doc_id = self.documents[0].id if self.documents else ""
+            if not self.current_doc_id:
+                self.current_variant = ""
+
+        self.add_history("delete_document", doc_id=doc_id, original_name=doc.original_name, delete_files=delete_files)
+        return True
 
     def get_current_doc(self) -> Optional[Document]:
         if not self.current_doc_id:
