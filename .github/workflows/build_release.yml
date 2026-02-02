@@ -1,0 +1,135 @@
+name: Build & Release (Windows + macOS)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Sert uniquement aux noms d'artifacts Actions
+  APP_ID: "pdf_corrections"
+
+  # Sert au nom de l'app construite (dossier / .app)
+  APP_NAME: "PDF Corrections"
+
+  # Sert au nom des fichiers publiés dans la Release
+  RELEASE_PREFIX: "PDF_Corrections"
+
+  ENTRYPOINT: "app/main.py"
+  PYTHON_VERSION: "3.11"
+  ICON_WIN: "assets/icon/app_icon.ico"
+  ICON_MAC: "assets/icon/app_icon.icns"
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+          - os: macos-15
+            label: macos-arm64
+          - os: macos-15-intel
+            label: macos-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pyinstaller-hooks-contrib
+          pip check
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force build, dist, *.spec -ErrorAction SilentlyContinue
+
+          if (Test-Path $env:ICON_WIN) {
+            pyinstaller --noconfirm --clean --windowed --name "$env:APP_NAME" --icon "$env:ICON_WIN" "$env:ENTRYPOINT"
+          } else {
+            pyinstaller --noconfirm --clean --windowed --name "$env:APP_NAME" "$env:ENTRYPOINT"
+          }
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          rm -rf build dist *.spec || true
+          ICON_ARGS=""
+          if [ -f "$ICON_MAC" ]; then ICON_ARGS="--icon $ICON_MAC"; fi
+          pyinstaller --noconfirm --clean --windowed --name "$APP_NAME" $ICON_ARGS "$ENTRYPOINT"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          $freeze = "artifacts/pip-freeze_${{ matrix.label }}.txt"
+          python -m pip freeze | Out-File -Encoding utf8 $freeze
+
+          $zip = "artifacts/$($env:RELEASE_PREFIX)_${{ github.ref_name }}_${{ matrix.label }}.zip"
+          Compress-Archive -Path "dist\$env:APP_NAME\*" -DestinationPath $zip -Force
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          python -m pip freeze > "artifacts/pip-freeze_${{ matrix.label }}.txt"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/$APP_NAME.app" \
+            "artifacts/${RELEASE_PREFIX}_${GITHUB_REF_NAME}_${{ matrix.label }}.zip"
+
+      - name: Upload artifact (Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          # <= Nom "technique" de l'artifact (APP_ID conservé)
+          name: ${{ env.APP_ID }}-${{ github.ref_name }}-${{ matrix.label }}
+          path: artifacts/*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -R artifacts
+
+      - name: Publish release + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/pip-freeze_*.txt
