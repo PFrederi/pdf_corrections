@@ -6,6 +6,7 @@
 - Correctif : évite l’erreur Tk ‘No more menus can be allocated’ lors des clics droits répétés.
 - Correction V0 : clic sur une pastille existante pour changer la notation (palette vert/orange/rouge).
 
+
 Fonctions :
 
 -   Importation de PDF + ajout optionnel d'une marge **0 / 2,5 / 5 cm** (gauche / droite / 2 côtés)
