@@ -503,7 +503,11 @@ class PDFViewer(ttk.Frame):
             return
         cx, cy = self._event_to_canvas_xy(e)
         p, x_pt, y_pt = self._canvas_to_pdf(cx, cy)
-        self._click_cb(p, x_pt, y_pt)
+        # Compat : certaines implémentations attendent aussi les coordonnées écran (x_root, y_root)
+        try:
+            self._click_cb(p, x_pt, y_pt, int(getattr(e, 'x_root', 0)), int(getattr(e, 'y_root', 0)))
+        except TypeError:
+            self._click_cb(p, x_pt, y_pt)
 
     def _on_drag(self, e):
         if self._drag_cb is None:

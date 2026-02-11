@@ -1,9 +1,9 @@
 # Corrections PDF — Projets (Tkinter)
 
-**Version : v0.7.12**
 
 - Import / Projet : suppression d’un PDF du projet avec confirmation (supprime aussi variantes + marques associées).
 - Correctif : évite l’erreur Tk ‘No more menus can be allocated’ lors des clics droits répétés.
+- Correction V0 : clic sur une pastille existante pour changer la notation (palette vert/orange/rouge).
 
 Fonctions :
 
@@ -14,6 +14,7 @@ Fonctions :
 -   **GuideCorrection** : overlays d’annotations réutilisables (enregistrer/charger, superposition, appliquer sur d’autres PDF)
 -   **Notation** : barème hiérarchique (n, n.X, option n.X.Y), export/import JSON, totaux par niveau
 -   **Correction V0** : sélection d'un item (feuille) + résultat → clic dans le PDF pour poser une pastille + libellé
+    -   **Confort** : clic sur une pastille existante → choix vert/orange/rouge pour modifier la notation
 -   **Points manuels** : outil "Points Ex" pour saisir des points par exercice principal (cercle rouge) → intégré au total et à la note finale
 -   **Infos** : points attribués / points max par exercice + total général (document courant)
 
@@ -49,6 +50,8 @@ python -m app.main
     Les points apparaissent en **rouge dans un cercle rouge** et sont intégrés à la note.
     ⚠️ Si un point manuel existe pour un exercice, il **remplace** le total des pastilles de cet exercice.
     Astuce : dans **Marques du document**, un **double-clic** sur une ligne **MANUEL** permet de modifier les points.
+    Astuce : dans **Correction V0**, un **clic sur une pastille** existante ouvre la palette vert/orange/rouge pour la modifier.
+    Astuce : **Annuler** via le bouton **Annuler** (Correction V0) ou le raccourci **Ctrl+Z / Cmd+Z**.
 
 Remarque : les annotations sont appliquées via la variante **corrected** (régénérée automatiquement à la fin du
 glisser).

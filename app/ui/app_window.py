@@ -11,6 +11,7 @@ from datetime import datetime
 import math
 import copy
 import sys
+from contextlib import contextmanager
 
 from app.ui.theme import apply_dark_theme, DARK_BG, DARK_BG_2
 from app.core.project import Project
@@ -95,7 +96,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.7.12"
+APP_VERSION = "0.7.15"
 
 
 class AppWindow:
@@ -104,6 +105,13 @@ class AppWindow:
         self.root.title(f"Corrections PDF — Projets v{APP_VERSION}")
         self.root.geometry("1280x860")
         apply_dark_theme(self.root)
+
+        # Annuler (Undo) — pastilles + points manuels (Correction V0)
+        self._undo_by_doc: dict[str, list[dict]] = {}
+        self._undo_max: int = 80
+        self._undo_suspend: int = 0
+        self._init_main_menu()
+        self._bind_undo_shortcuts()
 
         self.project: Project | None = None
         self._doc_ids: list[str] = []
@@ -243,6 +251,215 @@ class AppWindow:
         self.root.bind_all("<Button-5>", self._on_global_mousewheel_linux, add="+")
         # Raccourci ergonomique : masquer/afficher le panneau de gauche (Correction/Infos) pour agrandir la vue PDF
         self.root.bind("<F8>", lambda _e: self._toggle_view_left_pane(), add="+")
+
+    # ---------------- Annuler (Undo) : pastilles + points manuels ----------------
+
+    def _init_main_menu(self) -> None:
+        """Ajoute un menu Édition > Annuler (Ctrl+Z / Cmd+Z)."""
+        try:
+            menubar = tk.Menu(self.root)
+            edit = tk.Menu(menubar, tearoff=0)
+            accel = "Cmd+Z" if sys.platform == "darwin" else "Ctrl+Z"
+            edit.add_command(label="Annuler", command=self.undo_last_action, accelerator=accel, state="disabled")
+            self._edit_menu = edit
+            self._edit_menu_undo_index = int(edit.index('end'))
+            menubar.add_cascade(label="Édition", menu=edit)
+            self.root.config(menu=menubar)
+        except Exception:
+            # Le menu n'est pas indispensable (certaines configs Tk minimalistes).
+            self._edit_menu = None
+            self._edit_menu_undo_index = None
+
+    def _bind_undo_shortcuts(self) -> None:
+        """Raccourci global pour annuler la dernière action (pastilles + points manuels)."""
+        def _handler(e=None):
+            try:
+                w = getattr(e, 'widget', None)
+                if w is not None:
+                    cls = str(getattr(w, 'winfo_class', lambda: '')())
+                    # Laisse le Ctrl+Z aux champs de saisie quand c'est pertinent
+                    if cls in ("Entry", "TEntry", "Text"):  # Tk / ttk
+                        return
+            except Exception:
+                pass
+            try:
+                self.undo_last_action()
+            except Exception:
+                pass
+            return "break"
+
+        try:
+            self.root.bind_all('<Control-z>', _handler, add='+')
+            self.root.bind_all('<Control-Z>', _handler, add='+')
+        except Exception:
+            pass
+        try:
+            # macOS : Command+Z
+            self.root.bind_all('<Command-z>', _handler, add='+')
+            self.root.bind_all('<Command-Z>', _handler, add='+')
+        except Exception:
+            pass
+
+    def _current_doc_id(self) -> str | None:
+        if not self.project:
+            return None
+        try:
+            doc = self.project.get_current_doc()
+        except Exception:
+            doc = None
+        if not doc:
+            return None
+        try:
+            return str(doc.id)
+        except Exception:
+            return None
+
+    def _scores_undo_snapshot(self) -> dict | None:
+        """Snapshot des annotations concernées par l'annulation (pastilles + points manuels)."""
+        if not self.project:
+            return None
+        doc_id = self._current_doc_id()
+        if not doc_id:
+            return None
+        anns = self._annotations_for_current_doc()
+        kinds = {"score_circle", "manual_score"}
+
+        # subset
+        subset = []
+        first_score_i = None
+        for i, a in enumerate(anns):
+            if isinstance(a, dict) and a.get('kind') in kinds:
+                if first_score_i is None:
+                    first_score_i = i
+                subset.append(a)
+
+        if first_score_i is None:
+            first_score_i = len(anns)
+
+        # position d'insertion dans la liste des non-scores
+        insert_pos = 0
+        for a in anns[:first_score_i]:
+            if not (isinstance(a, dict) and a.get('kind') in kinds):
+                insert_pos += 1
+
+        return {
+            'doc_id': doc_id,
+            'scores': copy.deepcopy(subset),
+            'insert_pos': int(insert_pos),
+        }
+
+    def _push_scores_undo(self, label: str) -> None:
+        """Empile un snapshot pour pouvoir annuler (uniquement pastilles + points manuels)."""
+        if self._undo_suspend > 0:
+            return
+        snap = self._scores_undo_snapshot()
+        if not snap:
+            return
+        doc_id = snap.get('doc_id')
+        if not doc_id:
+            return
+        stack = self._undo_by_doc.setdefault(str(doc_id), [])
+
+        # évite les doublons (même état consécutif)
+        try:
+            if stack and stack[-1].get('scores') == snap.get('scores'):
+                return
+        except Exception:
+            pass
+
+        snap['label'] = str(label or 'Action')
+        try:
+            snap['ts'] = datetime.now().isoformat(timespec='seconds')
+        except Exception:
+            snap['ts'] = ''
+
+        stack.append(snap)
+        if len(stack) > int(self._undo_max):
+            del stack[0:len(stack)-int(self._undo_max)]
+        self._update_undo_ui()
+
+    def _can_undo(self) -> bool:
+        doc_id = self._current_doc_id()
+        if not doc_id:
+            return False
+        st = self._undo_by_doc.get(str(doc_id))
+        return bool(st)
+
+    def _update_undo_ui(self) -> None:
+        state = 'normal' if self._can_undo() else 'disabled'
+        # menu
+        try:
+            m = getattr(self, '_edit_menu', None)
+            idx = getattr(self, '_edit_menu_undo_index', None)
+            if m is not None and idx is not None:
+                m.entryconfig(idx, state=state)
+        except Exception:
+            pass
+        # bouton (Correction V0)
+        try:
+            btn = getattr(self, 'c_undo_btn', None)
+            if btn is not None:
+                btn.configure(state=state)
+        except Exception:
+            pass
+
+    @contextmanager
+    def _suspend_undo(self):
+        self._undo_suspend += 1
+        try:
+            yield
+        finally:
+            self._undo_suspend = max(0, int(self._undo_suspend) - 1)
+
+    def undo_last_action(self) -> None:
+        """Annule la dernière action (pastilles + points manuels) sur le document courant."""
+        if not self._require_doc():
+            return
+        doc_id = self._current_doc_id()
+        if not doc_id:
+            return
+        stack = self._undo_by_doc.get(str(doc_id))
+        if not stack:
+            return
+
+        snap = stack.pop()
+        kinds = {"score_circle", "manual_score"}
+        scores = snap.get('scores') or []
+        try:
+            insert_pos = int(snap.get('insert_pos', 0) or 0)
+        except Exception:
+            insert_pos = 0
+
+        anns = self._annotations_for_current_doc()
+        non_scores = [a for a in anns if not (isinstance(a, dict) and a.get('kind') in kinds)]
+        insert_pos = max(0, min(int(insert_pos), len(non_scores)))
+
+        with self._suspend_undo():
+            anns[:] = non_scores[:insert_pos] + copy.deepcopy(scores) + non_scores[insert_pos:]
+            try:
+                assert self.project is not None
+                self.project.save()
+            except Exception:
+                pass
+
+        # Regénère + MAJ UI
+        try:
+            self._schedule_regenerate(delay_ms=60)
+        except Exception:
+            try:
+                self.c_regenerate()
+            except Exception:
+                pass
+
+        for fn_name in ('_refresh_marks_list', '_refresh_files_list', '_refresh_info_panel', '_refresh_correction_totals'):
+            try:
+                fn = getattr(self, fn_name, None)
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
+
+        self._update_undo_ui()
 
     # ---------------- UI : Import/Projet ----------------
     def _build_tab_project(self) -> None:
@@ -664,6 +881,9 @@ class AppWindow:
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x")
+        # Annuler la dernière action de notation (pastilles / points manuels)
+        self.c_undo_btn = ttk.Button(btns, text="Annuler", command=self.undo_last_action)
+        self.c_undo_btn.pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="Supprimer sélection", command=(lambda: self.c_delete_selected() if hasattr(self, "c_delete_selected") else self.ann_delete_selected())).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text="Supprimer dernière", command=self.c_delete_last).pack(side="left")
 
@@ -685,6 +905,10 @@ class AppWindow:
         ttk.Button(frm, text="Supprimer la note finale", command=self.c_delete_final_note).pack(anchor="w", pady=(6, 0))
 
         self._refresh_correction_ui()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
 
 
 
@@ -2398,7 +2622,7 @@ class AppWindow:
         return math.hypot(px - cx, py - cy)
 
 
-    def _on_pdf_click(self, page_index: int, x_pt: float, y_pt: float) -> None:
+    def _on_pdf_click(self, page_index: int, x_pt: float, y_pt: float, x_root: int | None = None, y_root: int | None = None) -> None:
         # marque le début d'une interaction souris sur le canvas PDF (utilisé par le debounce regen)
         self._pdf_mouse_down = True
         self._last_interaction_page = int(page_index)
@@ -2483,7 +2707,7 @@ class AppWindow:
         except Exception:
             sub = ""
         if sub == "Correction V0":
-            self._on_pdf_click_for_correction(page_index, x_pt, y_pt)
+            self._on_pdf_click_for_correction(page_index, x_pt, y_pt, x_root=x_root, y_root=y_root)
 
     def _on_pdf_drag(self, page_index: int, x_pt: float, y_pt: float) -> None:
         # 1) déplacement d'une annotation sélectionnée (si mode sélection actif et clic sur ann)
@@ -3011,6 +3235,11 @@ class AppWindow:
         except Exception:
             pass
 
+        try:
+            self._push_scores_undo("Points manuels")
+        except Exception:
+            pass
+
         # Ajout / remplacement
         anns = self._annotations_for_current_doc()
         kept = []
@@ -3106,6 +3335,10 @@ class AppWindow:
         self.refresh_grading_tree()
         self._refresh_correction_ui()
         self._refresh_info_panel()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
 
     def _annotations_for_current_doc(self) -> list[dict]:
         assert self.project is not None
@@ -3219,6 +3452,10 @@ class AppWindow:
 
         self._refresh_correction_ui()
         self._refresh_info_panel()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
 
     def open_current_corrected(self) -> None:
         if not self._require_doc():
@@ -3288,6 +3525,10 @@ class AppWindow:
         self.refresh_grading_tree()
         self._refresh_correction_ui()
         self._refresh_info_panel()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
         self._update_click_mode()
         messagebox.showinfo("Projet", f"Projet créé :\n{self.project.root_dir}")
 
@@ -3343,6 +3584,10 @@ class AppWindow:
         self.refresh_grading_tree()
         self._refresh_correction_ui()
         self._refresh_info_panel()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
         self._update_click_mode()
 
         doc = self.project.get_current_doc()
@@ -3596,6 +3841,10 @@ class AppWindow:
         self._refresh_files_list()
         self._refresh_correction_ui()
         self._refresh_info_panel()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
 
         if last_doc_id:
             self._open_doc_in_viewer(last_doc_id)
@@ -3657,9 +3906,16 @@ class AppWindow:
         # Si le document courant est supprimé, on vide le viewer pour éviter d'afficher un PDF disparu
         if self.project.current_doc_id and self.project.current_doc_id in doc_ids:
             try:
-                self.pdf_viewer.clear()
+                self.viewer.clear()
             except Exception:
                 pass
+
+        # Nettoie aussi les historiques "Annuler" pour ces documents
+        try:
+            for d in doc_ids:
+                self._undo_by_doc.pop(str(d), None)
+        except Exception:
+            pass
 
         # Supprime (en cas de multiples, on ignore les erreurs sur un doc spécifique)
         for doc_id in doc_ids:
@@ -3667,7 +3923,6 @@ class AppWindow:
                 self.project.delete_document(doc_id, delete_files=True, delete_work_prefix=True)
             except Exception as e:
                 messagebox.showerror("Supprimer PDF", f"Impossible de supprimer un document ({doc_id}).\n\n{e}")
-
         try:
             self.project.save()
         except Exception:
@@ -3677,6 +3932,10 @@ class AppWindow:
         self._refresh_files_list()
         self._refresh_correction_ui()
         self._refresh_info_panel()
+        try:
+            self._update_undo_ui()
+        except Exception:
+            pass
 
         # Ré-ouvre un doc valide si possible
         if self.project.current_doc_id:
@@ -3686,7 +3945,7 @@ class AppWindow:
                 pass
         else:
             try:
-                self.pdf_viewer.clear()
+                self.viewer.clear()
             except Exception:
                 pass
 
@@ -4371,6 +4630,11 @@ class AppWindow:
         except Exception:
             pass
 
+        try:
+            self._push_scores_undo("Modifier points manuels")
+        except Exception:
+            pass
+
         # Mise à jour du marqueur (position conservée)
         cur['exercise_code'] = str(ex_code)
         cur['exercise_label'] = str(ex_label)
@@ -4706,7 +4970,95 @@ class AppWindow:
         if best_d2 is not None and best_d2 <= threshold_pt*threshold_pt:
             return best_idx, best_ann
         return None, None
-    def _on_pdf_click_for_correction(self, page_index: int, x_pt: float, y_pt: float) -> None:
+
+
+    def _popup_choose_pastille_result(self, x_root: int | None, y_root: int | None, current: str = "good") -> str | None:
+        """Petit popup (palette) pour choisir le résultat d'une pastille (vert/orange/rouge).
+
+        - Retourne "good" / "partial" / "bad" ou None si annulé.
+        - Utilise un Toplevel détruit immédiatement (pas de fuite de menus Tk).
+        """
+        # Fallback coordonnées écran
+        xr = int(x_root or 0)
+        yr = int(y_root or 0)
+        if xr <= 0 and yr <= 0:
+            try:
+                xr = int(self.root.winfo_pointerx())
+                yr = int(self.root.winfo_pointery())
+            except Exception:
+                xr, yr = 200, 200
+
+        cur = (str(current or "good") or "good").strip()
+        if cur not in ("good", "partial", "bad"):
+            cur = "good"
+
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        # Conteneur (bord fin)
+        frm = tk.Frame(top, bg="white", bd=1, relief="solid")
+        frm.pack(fill="both", expand=True)
+
+        chosen: dict[str, str | None] = {"val": None}
+
+        def _close():
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        def _choose(val: str):
+            chosen["val"] = val
+            _close()
+
+        def _cancel(_evt=None):
+            _close()
+
+        top.bind("<Escape>", _cancel)
+        top.bind("<FocusOut>", _cancel)
+
+        # 3 pastilles cliquables
+        for val in ("good", "partial", "bad"):
+            c = tk.Canvas(frm, width=34, height=34, bg="white", highlightthickness=0)
+            c.pack(side="left", padx=6, pady=6)
+            fill = RESULT_COLORS.get(val, RESULT_COLORS["good"])
+            outline = "#111827" if val == cur else "#9CA3AF"
+            width = 3 if val == cur else 2
+            c.create_oval(5, 5, 29, 29, fill=fill, outline=outline, width=width)
+            c.bind("<Button-1>", lambda _e, v=val: _choose(v))
+
+        # Positionne près du pointeur, mais reste dans l'écran
+        top.update_idletasks()
+        w = int(top.winfo_reqwidth())
+        h = int(top.winfo_reqheight())
+        try:
+            sw = int(top.winfo_screenwidth())
+            sh = int(top.winfo_screenheight())
+        except Exception:
+            sw, sh = 1920, 1080
+
+        x = max(0, min(int(xr), max(0, sw - w - 2)))
+        y = max(0, min(int(yr), max(0, sh - h - 2)))
+        top.geometry(f"{w}x{h}+{x}+{y}")
+
+        try:
+            top.grab_set()
+            top.focus_force()
+        except Exception:
+            pass
+
+        self.root.wait_window(top)
+        return chosen.get("val")
+
+    def _on_pdf_click_for_correction(self, page_index: int, x_pt: float, y_pt: float, x_root: int | None = None, y_root: int | None = None) -> None:
         # Mode déplacement
         if hasattr(self, "c_move_var") and self.c_move_var.get():
             if not self._require_doc():
@@ -4718,6 +5070,11 @@ class AppWindow:
                 self._drag_active = False
                 self._drag_target_idx = None
                 return
+
+            try:
+                self._push_scores_undo("Déplacer pastille")
+            except Exception:
+                pass
 
             self._drag_active = True
             self._drag_target_idx = idx
@@ -4735,6 +5092,62 @@ class AppWindow:
         assert self.project is not None
         doc = self.project.get_current_doc()
         assert doc is not None
+
+        # Confort : clic sur une pastille existante => choix vert/orange/rouge (édition)
+        idx_hit, ann_hit = self._find_nearest_marker(page_index, x_pt, y_pt)
+        if idx_hit is not None and isinstance(ann_hit, dict):
+            choice = None
+            try:
+                choice = self._popup_choose_pastille_result(x_root, y_root, current=str(ann_hit.get('result', 'good') or 'good'))
+            except Exception:
+                choice = None
+
+            if choice:
+                # met aussi l'état UI courant (pratique pour la prochaine pastille)
+                try:
+                    self.c_result_var.set(choice)
+                except Exception:
+                    pass
+
+                code0 = str(ann_hit.get('exercise_code', '') or '')
+                # recalcul points selon le barème
+                scheme = self._scheme()
+                try:
+                    pts0 = float(points_for(scheme, code0, choice))
+                except Exception:
+                    pts0 = float(ann_hit.get('points', 0.0) or 0.0)
+
+                try:
+                    self._push_scores_undo("Modifier pastille")
+                except Exception:
+                    pass
+                ann_hit['result'] = choice
+                ann_hit['points'] = float(pts0)
+
+                st = ann_hit.setdefault('style', {})
+                if isinstance(st, dict):
+                    st['fill'] = RESULT_COLORS.get(choice, RESULT_COLORS['good'])
+                    st.setdefault('label_fontsize', 11.0)
+                    st.setdefault('label_dx_pt', 15.0)
+                    st['label_style'] = self._get_pastille_label_style()
+
+                try:
+                    self.project.save()
+                except Exception:
+                    pass
+
+                # regen + UI
+                self.c_regenerate()
+                self._refresh_marks_list()
+                self._refresh_files_list()
+                self._refresh_info_panel()
+                self._refresh_correction_totals()
+
+                if hasattr(self, '_click_hint'):
+                    self._click_hint.configure(text=f"Mode clic : ON • modif {code0} ({choice})")
+
+            # Dans tous les cas, on ne crée pas de nouvelle pastille
+            return
 
         code = self._selected_leaf_code()
         if not code:
@@ -4765,6 +5178,11 @@ class AppWindow:
             },
             "payload": {}
         }
+
+        try:
+            self._push_scores_undo("Ajouter pastille")
+        except Exception:
+            pass
 
         anns = self._annotations_for_current_doc()
         anns.append(ann)
@@ -4867,6 +5285,11 @@ class AppWindow:
             "payload": {}
         }
 
+        try:
+            self._push_scores_undo("Ajouter pastille")
+        except Exception:
+            pass
+
         anns = self._annotations_for_current_doc()
         anns.append(ann)
         self.project.save()
@@ -4877,6 +5300,309 @@ class AppWindow:
         self._refresh_info_panel()
         self._refresh_correction_totals()
 
+
+    def _corr_refresh_after_change(self) -> None:
+        """Sauvegarde + regeneration + rafraichissement UI (Correction V0)."""
+        try:
+            assert self.project is not None
+            self.project.save()
+        except Exception:
+            pass
+        try:
+            self.c_regenerate()
+        except Exception:
+            pass
+        for fn_name in (
+            '_refresh_marks_list',
+            '_refresh_files_list',
+            '_refresh_info_panel',
+            '_refresh_correction_totals',
+        ):
+            try:
+                fn = getattr(self, fn_name, None)
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
+
+    def _corr_edit_pastille_at_index(self, ann_index: int, x_root: int | None = None, y_root: int | None = None) -> None:
+        """Edition rapide d'une pastille existante (palette vert/orange/rouge)."""
+        if not self._require_doc():
+            return
+        anns = self._annotations_for_current_doc()
+        if ann_index < 0 or ann_index >= len(anns):
+            return
+        ann = anns[ann_index]
+        if not (isinstance(ann, dict) and ann.get('kind') == 'score_circle'):
+            return
+
+        cur_res = str(ann.get('result', 'good') or 'good').strip()
+        if cur_res not in ('good', 'partial', 'bad'):
+            cur_res = 'good'
+
+        try:
+            choice = self._popup_choose_pastille_result(x_root, y_root, current=cur_res)
+        except Exception:
+            choice = None
+        if not choice:
+            return
+
+        code0 = str(ann.get('exercise_code', '') or '').strip()
+        scheme = self._scheme()
+        try:
+            pts = float(points_for(scheme, code0, choice))
+        except Exception:
+            pts = float(ann.get('points', 0.0) or 0.0)
+
+        ann['result'] = choice
+        ann['points'] = float(pts)
+
+        st = ann.setdefault('style', {})
+        if isinstance(st, dict):
+            st['fill'] = RESULT_COLORS.get(choice, RESULT_COLORS['good'])
+            st.setdefault('label_fontsize', 11.0)
+            st.setdefault('label_dx_pt', 15.0)
+            st['label_style'] = self._get_pastille_label_style()
+
+        # met aussi l'etat UI courant (pratique pour la prochaine pastille)
+        try:
+            self.c_result_var.set(choice)
+        except Exception:
+            pass
+
+        self._corr_refresh_after_change()
+
+    def _corr_delete_pastille_at_index(self, ann_index: int) -> None:
+        """Supprime une pastille (score_circle) par index dans la liste d'annotations."""
+        if not self._require_doc():
+            return
+        anns = self._annotations_for_current_doc()
+        if ann_index < 0 or ann_index >= len(anns):
+            return
+        ann = anns[ann_index]
+        if not (isinstance(ann, dict) and ann.get('kind') == 'score_circle'):
+            return
+
+        try:
+            self._push_scores_undo("Supprimer pastille")
+        except Exception:
+            pass
+        try:
+            del anns[ann_index]
+        except Exception:
+            return
+        self._corr_refresh_after_change()
+
+    def _corr_duplicate_pastille_at_index(self, ann_index: int, dy_pt: float = 16.0) -> None:
+        """Duplique une pastille (score_circle) par index. Decale legerement en Y pour eviter la superposition."""
+        if not self._require_doc():
+            return
+        anns = self._annotations_for_current_doc()
+        if ann_index < 0 or ann_index >= len(anns):
+            return
+        base = anns[ann_index]
+        if not (isinstance(base, dict) and base.get('kind') == 'score_circle'):
+            return
+
+        try:
+            self._push_scores_undo("Dupliquer pastille")
+        except Exception:
+            pass
+
+        import copy as _copy
+        import uuid as _uuid
+
+        dup = _copy.deepcopy(base)
+        dup['id'] = str(_uuid.uuid4())
+
+        # Decale legerement pour rendre la duplication visible
+        try:
+            dup['y_pt'] = float(dup.get('y_pt', 0.0) or 0.0) + float(dy_pt)
+        except Exception:
+            pass
+
+        # Si alignement marge actif : verrouille X
+        try:
+            pi = int(dup.get('page', 0))
+            if self._corr_align_margin_enabled():
+                rad = 9.0
+                try:
+                    rad = float((dup.get('style') or {}).get('radius_pt', 9.0) or 9.0)
+                except Exception:
+                    rad = 9.0
+                dup['x_pt'] = float(self._corr_margin_x_pt(pi, radius_pt=rad))
+        except Exception:
+            pass
+
+        try:
+            anns.insert(ann_index + 1, dup)
+        except Exception:
+            anns.append(dup)
+
+        self._corr_refresh_after_change()
+
+    def _corr_convert_pastille_to_manual(self, ann_index: int, interactive: bool = True, delete_pastilles: bool = False) -> None:
+        """Convertit une pastille en points manuels (exercice principal).
+
+        - interactive=True : ouvre la fenetre d'edition des points manuels (prefill avec le total auto de l'exercice)
+        - delete_pastilles=True : supprime ensuite toutes les pastilles de l'exercice (utile pour nettoyer)
+        """
+        if not self._require_doc():
+            return
+        assert self.project is not None
+
+        anns = self._annotations_for_current_doc()
+        if ann_index < 0 or ann_index >= len(anns):
+            return
+        ann = anns[ann_index]
+        if not (isinstance(ann, dict) and ann.get('kind') == 'score_circle'):
+            return
+
+        try:
+            self._push_scores_undo("Convertir en points manuels")
+        except Exception:
+            pass
+
+        code0 = str(ann.get('exercise_code', '') or '').strip()
+        ex_code = code0.split('.', 1)[0] if code0 else ''
+        if not ex_code:
+            return
+
+        # Total auto (pastilles) pour cet exercice principal
+        total_auto = 0.0
+        for a in anns:
+            if not (isinstance(a, dict) and a.get('kind') == 'score_circle'):
+                continue
+            c = str(a.get('exercise_code', '') or '').strip()
+            if not c:
+                continue
+            if c.split('.', 1)[0] != ex_code:
+                continue
+            try:
+                total_auto += float(a.get('points', 0.0) or 0.0)
+            except Exception:
+                pass
+
+        # Position (sur la pastille cliqued)
+        try:
+            page_index = int(ann.get('page', 0))
+        except Exception:
+            page_index = 0
+        try:
+            x_use = float(ann.get('x_pt', 0.0) or 0.0)
+            y_use = float(ann.get('y_pt', 0.0) or 0.0)
+        except Exception:
+            x_use, y_use = 0.0, 0.0
+
+        try:
+            if self._corr_align_margin_enabled():
+                x_use = float(self._corr_margin_x_pt(page_index, radius_pt=11.0))
+        except Exception:
+            pass
+
+        # Cherche un manuel existant pour cet exercice
+        ms_idx = None
+        for i, a in enumerate(anns):
+            if not (isinstance(a, dict) and a.get('kind') == 'manual_score'):
+                continue
+            c = str(a.get('exercise_code', '') or '').strip()
+            c = c.split('.', 1)[0] if c else ''
+            if c == ex_code:
+                ms_idx = i
+                break
+
+        if ms_idx is not None:
+            # Met a jour points + position, puis edite si demande
+            try:
+                anns[ms_idx]['page'] = int(page_index)
+                anns[ms_idx]['x_pt'] = float(x_use)
+                anns[ms_idx]['y_pt'] = float(y_use)
+                anns[ms_idx]['points'] = float(total_auto)
+            except Exception:
+                pass
+            try:
+                self.project.save()
+            except Exception:
+                pass
+            if interactive:
+                try:
+                    self._edit_manual_score_at_index(int(ms_idx))
+                except Exception:
+                    pass
+        else:
+            if interactive:
+                # Prefill et ouvre le dialog standard
+                try:
+                    self.manual_score_ex_var.set(ex_code)
+                except Exception:
+                    pass
+                try:
+                    self.manual_score_pts_var.set(str(float(total_auto)).replace('.', ','))
+                except Exception:
+                    pass
+                try:
+                    self._add_manual_score_at(int(page_index), float(x_use), float(y_use))
+                except Exception:
+                    pass
+            else:
+                # Creation silencieuse
+                ex_label = f"Exercice {ex_code}"
+                try:
+                    for ex in self._scheme().exercises:
+                        if str(getattr(ex, 'code', '')) == str(ex_code):
+                            ex_label = str(getattr(ex, 'label', ex_label) or ex_label)
+                            break
+                except Exception:
+                    pass
+
+                # unicite
+                kept = []
+                for a in anns:
+                    if isinstance(a, dict) and a.get('kind') == 'manual_score':
+                        c = str(a.get('exercise_code', '') or '').strip()
+                        c = c.split('.', 1)[0] if c else ''
+                        if c == ex_code:
+                            continue
+                    kept.append(a)
+                anns[:] = kept
+
+                import uuid as _uuid
+                anns.append({
+                    'id': str(_uuid.uuid4()),
+                    'kind': 'manual_score',
+                    'page': int(page_index),
+                    'x_pt': float(x_use),
+                    'y_pt': float(y_use),
+                    'exercise_code': str(ex_code),
+                    'exercise_label': str(ex_label),
+                    'points': float(total_auto),
+                    'style': {
+                        'radius_pt': 11.0,
+                        'border': BASIC_COLORS.get('rouge', '#EF4444'),
+                        'fill': '#FFFFFF',
+                        'label_fontsize': 11.0,
+                        'text_color': BASIC_COLORS.get('rouge', '#EF4444'),
+                    },
+                    'payload': {'tag': 'manual_score'},
+                })
+
+                try:
+                    self.project.save()
+                except Exception:
+                    pass
+                # regen/refresh
+                self._corr_refresh_after_change()
+
+        # Nettoyage optionnel : supprime toutes les pastilles de cet exercice
+        if delete_pastilles:
+            try:
+                anns = self._annotations_for_current_doc()
+                anns[:] = [a for a in anns if not (isinstance(a, dict) and a.get('kind') == 'score_circle' and str(a.get('exercise_code', '') or '').strip().split('.', 1)[0] == ex_code)]
+                self.project.save()
+            except Exception:
+                pass
+            self._corr_refresh_after_change()
+
     def _on_pdf_context_menu(self, page_index: int, x_pt: float, y_pt: float, x_root: int, y_root: int) -> None:
         """
         Clic-droit sur le PDF (dans Correction V0) :
@@ -4884,10 +5610,6 @@ class AppWindow:
         Place directement la pastille à la position du clic-droit.
         """
         if not self.project:
-            return
-
-        # En mode "déplacer une pastille", on ne déclenche pas le menu (sinon conflit)
-        if hasattr(self, "c_move_var") and self.c_move_var.get():
             return
 
         scheme = self._scheme()
@@ -4937,6 +5659,76 @@ class AppWindow:
             menu.configure(bg=DARK_BG_2, fg="white", activebackground="#2F81F7", activeforeground="white")
         except Exception:
             pass
+
+        # Action globale : Annuler (pastilles + points manuels)
+        try:
+            state_undo = 'normal' if self._can_undo() else 'disabled'
+        except Exception:
+            state_undo = 'disabled'
+        try:
+            accel = 'Cmd+Z' if sys.platform == 'darwin' else 'Ctrl+Z'
+            menu.add_command(label=f'Annuler ({accel})', state=state_undo, command=lambda: (_destroy_ctx_menu(), self.undo_last_action()))
+            menu.add_separator()
+        except Exception:
+            pass
+
+        # Si mode déplacer actif : on affiche seulement Annuler (évite les conflits)
+        if hasattr(self, 'c_move_var') and self.c_move_var.get():
+            menu.add_command(label='Fermer', command=_destroy_ctx_menu)
+            try:
+                menu.tk_popup(x_root, y_root)
+            finally:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+            return
+
+        # Actions rapides : clic-droit sur une pastille existante
+        try:
+            idx_hit, ann_hit = self._find_nearest_marker(page_index, x_pt, y_pt, threshold_pt=18.0)
+        except Exception:
+            idx_hit, ann_hit = None, None
+
+        if idx_hit is not None and isinstance(ann_hit, dict):
+            ex_code = str(ann_hit.get('exercise_code', '') or '').strip()
+            ex_code = ex_code.split('.', 1)[0] if ex_code else ''
+
+            menu.add_command(
+                label="Modifier (vert/orange/rouge)...",
+                command=lambda i=int(idx_hit): (_destroy_ctx_menu(), self._corr_edit_pastille_at_index(i, x_root, y_root))
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="Supprimer la pastille",
+                command=lambda i=int(idx_hit): (_destroy_ctx_menu(), self._corr_delete_pastille_at_index(i))
+            )
+            menu.add_command(
+                label="Dupliquer la pastille",
+                command=lambda i=int(idx_hit): (_destroy_ctx_menu(), self._corr_duplicate_pastille_at_index(i))
+            )
+            if ex_code:
+                menu.add_separator()
+                menu.add_command(
+                    label=f"Convertir en points manuels (Ex {ex_code})...",
+                    command=lambda i=int(idx_hit): (_destroy_ctx_menu(), self._corr_convert_pastille_to_manual(i, interactive=True, delete_pastilles=False))
+                )
+                menu.add_command(
+                    label=f"Convertir + supprimer les pastilles (Ex {ex_code})",
+                    command=lambda i=int(idx_hit): (_destroy_ctx_menu(), self._corr_convert_pastille_to_manual(i, interactive=False, delete_pastilles=True))
+                )
+
+            menu.add_separator()
+            menu.add_command(label="Fermer", command=_destroy_ctx_menu)
+
+            try:
+                menu.tk_popup(x_root, y_root)
+            finally:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+            return
 
         if not scheme.exercises:
             menu.add_command(label="(Aucun barème défini)", state="disabled")
@@ -5078,6 +5870,12 @@ class AppWindow:
         anns = self._annotations_for_current_doc()
         if not anns:
             return
+        try:
+            last = anns[-1]
+            if isinstance(last, dict) and last.get('kind') in ('score_circle','manual_score'):
+                self._push_scores_undo('Supprimer dernière')
+        except Exception:
+            pass
         anns.pop()
         assert self.project is not None
         self.project.save()
@@ -5120,6 +5918,11 @@ class AppWindow:
 
         if ann_idx is None or ann_idx < 0 or ann_idx >= len(anns):
             return
+
+        try:
+            self._push_scores_undo("Supprimer sélection")
+        except Exception:
+            pass
 
         try:
             del anns[ann_idx]
