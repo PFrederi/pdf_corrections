@@ -5,6 +5,7 @@
 - Import / Projet : suppression d’un PDF du projet avec confirmation (supprime aussi variantes + marques associées).
 - Correctif : évite l’erreur Tk ‘No more menus can be allocated’ lors des clics droits répétés.
 - Correction V0 : clic sur une pastille existante pour changer la notation (palette vert/orange/rouge).
+- **Annuler (Ctrl+Z / Cmd+Z)** : annule la dernière action de **notation** (pastilles + points manuels) sur le document courant.
 
 
 Fonctions :
