@@ -1,11 +1,14 @@
 # Corrections PDF — Projets (Tkinter)
 
-**Version : v0.7.15**
+**Version : v0.7.19**
 
 - Import / Projet : suppression d’un PDF du projet avec confirmation (supprime aussi variantes + marques associées).
 - Correctif : évite l’erreur Tk ‘No more menus can be allocated’ lors des clics droits répétés.
 - Correction V0 : clic sur une pastille existante pour changer la notation (palette vert/orange/rouge).
 - **Annuler (Ctrl+Z / Cmd+Z)** : annule la dernière action de **notation** (pastilles + points manuels) sur le document courant.
+- **Menu Fichier** : Nouveau projet (demande le nom), Ouvrir projet, Enregistrer + liste des projets récents.
+- La barre haute ne contient plus les boutons **Nouveau/Ouvrir/Enregistrer** (tout est dans **Fichier**).
+- La barre haute ne contient plus **Nom du projet** (le nom reste dans le dossier du projet et dans project.json).
 
 
 Fonctions :

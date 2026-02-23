@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -96,7 +97,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.7.15"
+APP_VERSION = "0.7.19"
 
 
 class AppWindow:
@@ -110,6 +111,8 @@ class AppWindow:
         self._undo_by_doc: dict[str, list[dict]] = {}
         self._undo_max: int = 80
         self._undo_suspend: int = 0
+        # Projets récents (menu Fichier)
+        self._recent_projects: list[str] = self._load_recent_projects()
         self._init_main_menu()
         self._bind_undo_shortcuts()
 
@@ -207,20 +210,11 @@ class AppWindow:
         # Outil "Image (PNG)" : géré dans un module séparé pour ne pas alourdir app_window.py
         self.image_tool = ImageStampTool(self)
         # --- Barre haute ---
-        top = ttk.Frame(root)
-        top.pack(fill="x", padx=10, pady=10)
-
-        ttk.Label(top, text="Nom du projet :").pack(side="left")
-        self.project_name_var = tk.StringVar(value="")
-        ttk.Entry(top, textvariable=self.project_name_var, width=40).pack(side="left", padx=8)
-
-        ttk.Button(top, text="Nouveau projet…", command=self.new_project).pack(side="left", padx=4)
-        ttk.Button(top, text="Ouvrir projet…", command=self.open_project).pack(side="left", padx=4)
-        ttk.Button(top, text="Enregistrer", command=self.save_project).pack(side="left", padx=12)
+        # (supprimée : le nom du projet est géré via le menu "Fichier")
 
         # --- Onglets principaux ---
         self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.nb.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.tab_project = ttk.Frame(self.nb)
         self.tab_view = ttk.Frame(self.nb)
@@ -254,21 +248,242 @@ class AppWindow:
 
     # ---------------- Annuler (Undo) : pastilles + points manuels ----------------
 
+
+    # ---------------- Menu Fichier : projets récents ----------------
+
+    def _config_dir(self) -> Path:
+        """Dossier de configuration utilisateur (pour stocker les projets récents)."""
+        try:
+            if sys.platform.startswith('win'):
+                base = Path(os.environ.get('APPDATA') or Path.home())
+                return (base / 'FredC').resolve()
+            if sys.platform == 'darwin':
+                return (Path.home() / 'Library' / 'Application Support' / 'FredC').resolve()
+            xdg = os.environ.get('XDG_CONFIG_HOME')
+            if xdg:
+                return (Path(xdg) / 'FredC').resolve()
+            return (Path.home() / '.config' / 'FredC').resolve()
+        except Exception:
+            return (Path.home() / '.fredc').resolve()
+
+    def _recent_projects_file(self) -> Path:
+        return self._config_dir() / 'recent_projects.json'
+
+    def _load_recent_projects(self) -> list[str]:
+        """Charge la liste des projets récents (liste de dossiers racines)."""
+        try:
+            fp = self._recent_projects_file()
+            if not fp.exists():
+                return []
+            data = json.loads(fp.read_text(encoding='utf-8'))
+            if not isinstance(data, list):
+                return []
+            out: list[str] = []
+            for x in data:
+                try:
+                    px = str(Path(x).expanduser().resolve())
+                except Exception:
+                    continue
+                if px not in out:
+                    out.append(px)
+            out = [x for x in out if Path(x).exists()]
+            return out[:12]
+        except Exception:
+            return []
+
+    def _save_recent_projects(self) -> None:
+        try:
+            fp = self._recent_projects_file()
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(json.dumps(self._recent_projects[:12], ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    def _project_display_label(self, root_dir: Path) -> str:
+        """Libellé humain pour un projet (nom dans project.json si possible)."""
+        root_dir = Path(root_dir)
+        try:
+            pj = root_dir / 'project.json'
+            if pj.exists():
+                data = json.loads(pj.read_text(encoding='utf-8'))
+                if isinstance(data, dict) and str(data.get('name') or '').strip():
+                    return str(data.get('name')).strip()
+        except Exception:
+            pass
+        try:
+            return root_dir.name or str(root_dir)
+        except Exception:
+            return str(root_dir)
+
+    def _add_recent_project(self, root_dir: Path) -> None:
+        try:
+            pth = str(Path(root_dir).expanduser().resolve())
+        except Exception:
+            return
+        if not pth:
+            return
+        self._recent_projects = [x for x in (self._recent_projects or []) if x and Path(x).exists()]
+        self._recent_projects = [x for x in self._recent_projects if x != pth]
+        self._recent_projects.insert(0, pth)
+        self._recent_projects = self._recent_projects[:12]
+        self._save_recent_projects()
+        self._rebuild_recent_projects_menu()
+
+    def _clear_recent_projects(self) -> None:
+        try:
+            self._recent_projects = []
+            self._save_recent_projects()
+            self._rebuild_recent_projects_menu()
+        except Exception:
+            pass
+
+    def _rebuild_recent_projects_menu(self) -> None:
+        """Reconstruit la section 'Projets récents' du menu Fichier."""
+        m = getattr(self, '_file_menu', None)
+        first = getattr(self, '_file_recent_first_index', None)
+        if m is None or first is None:
+            return
+
+        try:
+            last = m.index('end')
+            if last is not None and last >= first:
+                m.delete(first, 'end')
+        except Exception:
+            pass
+
+        try:
+            self._recent_projects = [x for x in (self._recent_projects or []) if x and Path(x).exists()]
+        except Exception:
+            self._recent_projects = []
+
+        if not self._recent_projects:
+            try:
+                m.add_command(label='(Aucun projet récent)', state='disabled')
+            except Exception:
+                pass
+            return
+
+        for i, pth in enumerate(self._recent_projects[:10], start=1):
+            try:
+                root = Path(pth)
+                label = self._project_display_label(root)
+                short = root.name
+                txt = f"{i}. {label} — {short}"
+                m.add_command(label=txt, command=lambda pp=pth: self.open_recent_project(pp))
+            except Exception:
+                continue
+
+        try:
+            m.add_separator()
+            m.add_command(label='Effacer les projets récents', command=self._clear_recent_projects)
+        except Exception:
+            pass
+
+    def open_recent_project(self, root_path: str) -> None:
+        """Ouvre un projet depuis la liste des projets récents (sans boîte de dialogue)."""
+        if not root_path:
+            return
+        self._open_project_from_path(Path(root_path))
+
     def _init_main_menu(self) -> None:
-        """Ajoute un menu Édition > Annuler (Ctrl+Z / Cmd+Z)."""
+        """Menu principal : Fichier + Édition (Annuler)."""
         try:
             menubar = tk.Menu(self.root)
+
+            # --- Fichier ---
+            filem = tk.Menu(menubar, tearoff=0)
+            accel_new = 'Cmd+N' if sys.platform == 'darwin' else 'Ctrl+N'
+            accel_open = 'Cmd+O' if sys.platform == 'darwin' else 'Ctrl+O'
+            accel_save = 'Cmd+S' if sys.platform == 'darwin' else 'Ctrl+S'
+            filem.add_command(label='Nouveau projet…', command=self.new_project, accelerator=accel_new)
+            filem.add_command(label='Ouvrir projet…', command=self.open_project, accelerator=accel_open)
+            filem.add_command(label='Enregistrer', command=self.save_project, accelerator=accel_save)
+            filem.add_separator()
+            self._file_menu = filem
+            self._file_recent_first_index = int(filem.index('end')) + 1
+            self._rebuild_recent_projects_menu()
+            menubar.add_cascade(label='Fichier', menu=filem)
+
+            # --- Édition ---
             edit = tk.Menu(menubar, tearoff=0)
-            accel = "Cmd+Z" if sys.platform == "darwin" else "Ctrl+Z"
-            edit.add_command(label="Annuler", command=self.undo_last_action, accelerator=accel, state="disabled")
+            accel_undo = 'Cmd+Z' if sys.platform == 'darwin' else 'Ctrl+Z'
+            edit.add_command(label='Annuler', command=self.undo_last_action, accelerator=accel_undo, state='disabled')
             self._edit_menu = edit
             self._edit_menu_undo_index = int(edit.index('end'))
-            menubar.add_cascade(label="Édition", menu=edit)
+            menubar.add_cascade(label='Édition', menu=edit)
+
             self.root.config(menu=menubar)
+            self._menubar = menubar
+
+            # Raccourcis Fichier (pratique)
+            self._bind_file_shortcuts()
+
         except Exception:
             # Le menu n'est pas indispensable (certaines configs Tk minimalistes).
+            self._menubar = None
+            self._file_menu = None
+            self._file_recent_first_index = None
             self._edit_menu = None
             self._edit_menu_undo_index = None
+
+
+    def _bind_file_shortcuts(self) -> None:
+        """Ctrl/Cmd+N/O/S vers Nouveau/Ouvrir/Enregistrer (sans casser la saisie texte)."""
+        def _ignore_text_widget(e) -> bool:
+            try:
+                w = getattr(e, 'widget', None)
+                if w is None:
+                    return False
+                cls = str(getattr(w, 'winfo_class', lambda: '')())
+                return cls in ('Entry', 'TEntry', 'Text')
+            except Exception:
+                return False
+
+        def _new(e=None):
+            if e is not None and _ignore_text_widget(e):
+                return
+            try:
+                self.new_project()
+            except Exception:
+                pass
+            return 'break'
+
+        def _open(e=None):
+            if e is not None and _ignore_text_widget(e):
+                return
+            try:
+                self.open_project()
+            except Exception:
+                pass
+            return 'break'
+
+        def _save(e=None):
+            if e is not None and _ignore_text_widget(e):
+                return
+            try:
+                self.save_project()
+            except Exception:
+                pass
+            return 'break'
+
+        try:
+            self.root.bind_all('<Control-n>', _new, add='+')
+            self.root.bind_all('<Control-N>', _new, add='+')
+            self.root.bind_all('<Control-o>', _open, add='+')
+            self.root.bind_all('<Control-O>', _open, add='+')
+            self.root.bind_all('<Control-s>', _save, add='+')
+            self.root.bind_all('<Control-S>', _save, add='+')
+        except Exception:
+            pass
+        try:
+            self.root.bind_all('<Command-n>', _new, add='+')
+            self.root.bind_all('<Command-N>', _new, add='+')
+            self.root.bind_all('<Command-o>', _open, add='+')
+            self.root.bind_all('<Command-O>', _open, add='+')
+            self.root.bind_all('<Command-s>', _save, add='+')
+            self.root.bind_all('<Command-S>', _save, add='+')
+        except Exception:
+            pass
 
     def _bind_undo_shortcuts(self) -> None:
         """Raccourci global pour annuler la dernière action (pastilles + points manuels)."""
@@ -1341,11 +1556,30 @@ class AppWindow:
         self.gc_overlay_info_var = tk.StringVar(value="—")
         ttk.Label(sel_box, textvariable=self.gc_overlay_info_var).pack(anchor="w", padx=10, pady=(0, 8))
 
-        btn_row = ttk.Frame(sel_box)
-        btn_row.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(btn_row, text="Appliquer au document (copier dans marques + régénérer)", command=self._apply_selected_overlay_to_current_doc).pack(side="left")
-        ttk.Button(btn_row, text="Mettre à jour l'overlay (écraser)", command=self._update_selected_overlay_from_current_doc).pack(side="left", padx=(8, 0))
-        ttk.Button(btn_row, text="Supprimer overlay", command=self._delete_selected_overlay).pack(side="left", padx=(8, 0))
+        # Boutons : pour réduire la largeur, on place "Mettre à jour" puis "Supprimer" sur des lignes séparées
+        btn_row1 = ttk.Frame(sel_box)
+        btn_row1.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(
+            btn_row1,
+            text="Appliquer au document (copier dans marques + régénérer)",
+            command=self._apply_selected_overlay_to_current_doc,
+        ).pack(side="left")
+
+        btn_row2 = ttk.Frame(sel_box)
+        btn_row2.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(
+            btn_row2,
+            text="Mettre à jour l'overlay (écraser)",
+            command=self._update_selected_overlay_from_current_doc,
+        ).pack(side="left")
+
+        btn_row3 = ttk.Frame(sel_box)
+        btn_row3.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(
+            btn_row3,
+            text="Supprimer overlay",
+            command=self._delete_selected_overlay,
+        ).pack(side="left")
 
         # Création overlay
         create_box = ttk.LabelFrame(frm, text="Créer un nouvel overlay")
@@ -3478,10 +3712,15 @@ class AppWindow:
 
     # ---------------- Projet ----------------
     def new_project(self) -> None:
+        # Demande d'abord le nom du projet, puis le dossier parent
+        default_name = (self.project.name if self.project else "Nouveau projet")
+        name = simpledialog.askstring("Nouveau projet", "Nom du projet :", initialvalue=default_name)
+        if not name:
+            return
         parent = filedialog.askdirectory(title="Choisir un dossier parent pour le projet")
         if not parent:
             return
-        name = self.project_name_var.get().strip() or "Nouveau projet"
+
         try:
             self.project = Project.create(Path(parent), name=name)
         except Exception as e:
@@ -3518,8 +3757,6 @@ class AppWindow:
             self.image_tool.refresh_options()
         except Exception:
             pass
-
-        self.project_name_var.set(self.project.name)
         self._refresh_files_list()
         self.viewer.clear()
         self.refresh_grading_tree()
@@ -3532,13 +3769,8 @@ class AppWindow:
         self._update_click_mode()
         messagebox.showinfo("Projet", f"Projet créé :\n{self.project.root_dir}")
 
-    def open_project(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Ouvrir un projet (project.json)",
-            filetypes=_sanitize_tk_filetypes([("Projet JSON", "project.json"), ("JSON", "*.json"), ("Tous fichiers", "*.*")])
-        )
-        if not path:
-            return
+    def _open_project_from_path(self, path: Path) -> None:
+        """Ouvre un projet à partir d'un chemin (dossier ou project.json)."""
         try:
             self.project = Project.load_any(Path(path))
         except Exception as e:
@@ -3562,8 +3794,6 @@ class AppWindow:
             pass
         self.project.save()
 
-        # recharge la bibliothèque d'images (outil Image)
-
         # GuideCorrection overlays
         try:
             self._refresh_guide_overlay_list()
@@ -3578,8 +3808,6 @@ class AppWindow:
             pass
 
         self._ensure_project_margins()
-
-        self.project_name_var.set(self.project.name)
         self._refresh_files_list()
         self.refresh_grading_tree()
         self._refresh_correction_ui()
@@ -3594,11 +3822,25 @@ class AppWindow:
         if doc:
             self._open_doc_in_viewer(doc.id)
 
+        # projets récents
+        try:
+            self._add_recent_project(self.project.root_dir)
+        except Exception:
+            pass
+
+    def open_project(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Ouvrir un projet (project.json)",
+            filetypes=_sanitize_tk_filetypes([("Projet JSON", "project.json"), ("JSON", "*.json"), ("Tous fichiers", "*.*")])
+        )
+        if not path:
+            return
+        self._open_project_from_path(Path(path))
+
     def save_project(self) -> None:
         if not self._require_project():
             return
         assert self.project is not None
-        self.project.name = self.project_name_var.get().strip() or self.project.name
         self.project.settings["grading_scheme"] = ensure_scheme_dict(self.project.settings.get("grading_scheme"))
         self.project.settings.setdefault("annotations", {})
         self.project.settings.setdefault("pastille_label_style", "blue")
