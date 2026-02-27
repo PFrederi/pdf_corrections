@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -21,6 +22,19 @@ from app.services.pdf_lock import export_locked
 from app.services.pdf_annotate import apply_annotations, RESULT_COLORS, BASIC_COLORS
 from app.services.pdf_recap_to_csv_table_fixed2 import collect_results as recap_collect_results, write_csv as recap_write_csv
 from app.ui.image_tool import ImageStampTool
+from app.ui.image_library import (
+    sync_project_library_to_global,
+    sync_global_library_to_project,
+    get_global_library,
+    resolve_image_abs as img_lib_resolve_image_abs,
+    resolve_entry_abs as img_lib_resolve_entry_abs,
+    list_categories as img_lib_list_categories,
+    list_library as img_lib_list_library,
+    add_category as img_lib_add_category,
+    add_images_to_library as img_lib_add_images,
+    remove_image_from_library as img_lib_remove_image,
+    export_library_to_zip as img_lib_export_zip,
+)
 from app.ui.widgets.scrollable_frame import VScrollableFrame
 
 def _sanitize_tk_filetypes(filetypes):
@@ -97,7 +111,7 @@ from app.core.grading import (
 )
 
 
-APP_VERSION = "0.7.19"
+APP_VERSION = "0.7.29"
 
 
 class AppWindow:
@@ -141,12 +155,6 @@ class AppWindow:
         self.text_value_var = tk.StringVar(value="")     # texte à placer (optionnel)
 
         # Saisie de points manuels (par exercice principal)
-        self.manual_score_ex_var = tk.StringVar(value="")
-        self.manual_score_pts_var = tk.StringVar(value="")
-
-
-        # Points manuels (par exercice principal)
-        # Outil: "Points Ex" (cercle rouge)
         self.manual_score_ex_var = tk.StringVar(value="")
         self.manual_score_pts_var = tk.StringVar(value="")
 
@@ -256,6 +264,21 @@ class AppWindow:
         try:
             if sys.platform.startswith('win'):
                 base = Path(os.environ.get('APPDATA') or Path.home())
+                return (base / 'Pdf_correction').resolve()
+            if sys.platform == 'darwin':
+                return (Path.home() / 'Library' / 'Application Support' / 'Pdf_correction').resolve()
+            xdg = os.environ.get('XDG_CONFIG_HOME')
+            if xdg:
+                return (Path(xdg) / 'Pdf_correction').resolve()
+            return (Path.home() / '.config' / 'Pdf_correction').resolve()
+        except Exception:
+            return (Path.home() / '.pdf_correction').resolve()
+
+    def _legacy_config_dir(self) -> Path:
+        """Ancien dossier (migration depuis FredC)."""
+        try:
+            if sys.platform.startswith('win'):
+                base = Path(os.environ.get('APPDATA') or Path.home())
                 return (base / 'FredC').resolve()
             if sys.platform == 'darwin':
                 return (Path.home() / 'Library' / 'Application Support' / 'FredC').resolve()
@@ -266,12 +289,28 @@ class AppWindow:
         except Exception:
             return (Path.home() / '.fredc').resolve()
 
+    def _maybe_migrate_recent_projects(self) -> None:
+        """Migration douce des projets récents depuis l'ancien dossier FredC."""
+        try:
+            dst = self._recent_projects_file()
+            if dst.exists():
+                return
+            candidates = [self._legacy_config_dir() / 'recent_projects.json', Path.home() / '.fredc' / 'recent_projects.json']
+            for src in candidates:
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    return
+        except Exception:
+            pass
+
     def _recent_projects_file(self) -> Path:
         return self._config_dir() / 'recent_projects.json'
 
     def _load_recent_projects(self) -> list[str]:
         """Charge la liste des projets récents (liste de dossiers racines)."""
         try:
+            self._maybe_migrate_recent_projects()
             fp = self._recent_projects_file()
             if not fp.exists():
                 return []
@@ -412,6 +451,15 @@ class AppWindow:
             self._edit_menu_undo_index = int(edit.index('end'))
             menubar.add_cascade(label='Édition', menu=edit)
 
+            # --- Bibliothèque ---
+            libm = tk.Menu(menubar, tearoff=0)
+            imgm = tk.Menu(libm, tearoff=0)
+            imgm.add_command(label='Gérer la bibliothèque…', command=self.open_global_image_library_manager)
+            imgm.add_command(label='Exporter la bibliothèque…', command=self.export_global_image_library)
+            libm.add_cascade(label='Images', menu=imgm)
+            menubar.add_cascade(label='Bibliothèque', menu=libm)
+            self._library_menu = libm
+
             self.root.config(menu=menubar)
             self._menubar = menubar
 
@@ -484,6 +532,512 @@ class AppWindow:
             self.root.bind_all('<Command-S>', _save, add='+')
         except Exception:
             pass
+
+    # ---------------- Bibliothèque (Images) ----------------
+    def _sync_global_images_to_current_project(self) -> None:
+        """Réapplique la bibliothèque globale au projet courant (best-effort) et rafraîchit l'outil Image."""
+        if not self.project:
+            return
+        try:
+            sync_global_library_to_project(self.project)
+        except Exception:
+            return
+        try:
+            self.project.save()
+        except Exception:
+            pass
+        try:
+            self.image_tool.refresh_options()
+        except Exception:
+            pass
+
+    def export_global_image_library(self) -> None:
+        """Exporte la bibliothèque globale d'images (ZIP)."""
+        gl = get_global_library()
+
+        # Pillow (aperçu thumbnails dans la fenêtre Bibliothèque)
+        try:
+            from PIL import Image, ImageTk  # type: ignore
+        except Exception:
+            Image = None  # type: ignore
+            ImageTk = None  # type: ignore
+
+
+        dest = filedialog.asksaveasfilename(
+            title="Exporter la bibliothèque d'images (ZIP)",
+            defaultextension=".zip",
+            filetypes=_sanitize_tk_filetypes([
+                ("ZIP", "*.zip"),
+                ("Tous fichiers", "*.*"),
+            ]),
+        )
+        if not dest:
+            return
+        ok, msg = img_lib_export_zip(gl, dest, category=None)
+        if ok:
+            messagebox.showinfo("Bibliothèque d'images", msg)
+        else:
+            messagebox.showwarning("Bibliothèque d'images", msg)
+
+    def open_global_image_library_manager(self) -> None:
+        """Fenêtre de gestion de la bibliothèque globale d'images."""
+        # Si déjà ouverte, on la ramène au premier plan.
+        try:
+            w = getattr(self, '_imglib_win', None)
+            if w is not None and w.winfo_exists():
+                w.deiconify()
+                w.lift()
+                try:
+                    w.focus_force()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        gl = get_global_library()
+
+        # Pillow (aperçu thumbnails dans la fenêtre Bibliothèque)
+        try:
+            from PIL import Image, ImageTk  # type: ignore
+        except Exception:
+            Image = None  # type: ignore
+            ImageTk = None  # type: ignore
+
+
+        win = tk.Toplevel(self.root)
+        self._imglib_win = win
+        self._imglib_preview_photo = None
+        win.title("Bibliothèque — Images")
+        win.geometry("820x520")
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill='both', expand=True)
+
+        # Paned layout
+        pan = ttk.Panedwindow(root, orient='horizontal')
+        pan.pack(fill='both', expand=True)
+
+        # --- Categories
+        left = ttk.Frame(pan)
+        pan.add(left, weight=1)
+        ttk.Label(left, text="Catégories").pack(anchor='w')
+
+        cat_btns = ttk.Frame(left)
+        cat_btns.pack(fill='x', pady=(6, 4))
+        ttk.Button(cat_btns, text="Nouvelle catégorie…", command=lambda: _add_category()).pack(side='left')
+
+        cat_frame = ttk.Frame(left)
+        cat_frame.pack(fill='both', expand=True)
+        cat_scroll = ttk.Scrollbar(cat_frame, orient='vertical')
+        cat_list = tk.Listbox(cat_frame, exportselection=False, height=12)
+        cat_list.pack(side='left', fill='both', expand=True)
+        cat_scroll.pack(side='right', fill='y')
+        cat_list.config(yscrollcommand=cat_scroll.set)
+        cat_scroll.config(command=cat_list.yview)
+
+        # --- Images
+        right = ttk.Frame(pan)
+        pan.add(right, weight=2)
+        ttk.Label(right, text="Images (par catégorie)").pack(anchor='w')
+
+        img_btns = ttk.Frame(right)
+        img_btns.pack(fill='x', pady=(6, 4))
+        ttk.Button(img_btns, text="Ajouter image(s)…", command=lambda: _add_images()).pack(side='left')
+        ttk.Button(img_btns, text="Supprimer image", command=lambda: _delete_image()).pack(side='left', padx=(6, 0))
+
+        # Zone liste + aperçu
+        img_frame = ttk.Frame(right)
+        img_frame.pack(fill='both', expand=True)
+
+        img_container = ttk.Frame(img_frame)
+        img_container.pack(fill='both', expand=True)
+
+        # liste (gauche)
+        img_list_frame = ttk.Frame(img_container)
+        img_list_frame.pack(side='left', fill='both', expand=True)
+
+        img_scroll = ttk.Scrollbar(img_list_frame, orient='vertical')
+        img_list = tk.Listbox(img_list_frame, exportselection=False)
+        img_list.pack(side='left', fill='both', expand=True)
+        img_scroll.pack(side='right', fill='y')
+        img_list.config(yscrollcommand=img_scroll.set)
+        img_scroll.config(command=img_list.yview)
+
+        # aperçu (droite)
+        preview = ttk.Labelframe(img_container, text="Aperçu", padding=8)
+        preview.pack(side='right', fill='both', padx=(10, 0))
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(0, weight=1)
+
+        preview_img_lbl = tk.Label(preview, bd=1, relief='solid', bg='white')
+        preview_img_lbl.grid(row=0, column=0, sticky='nsew')
+
+        preview_info_var = tk.StringVar(value="")
+        ttk.Label(preview, textvariable=preview_info_var).grid(row=1, column=0, sticky='w', pady=(6, 0))
+
+        # Actions sur l'image sélectionnée (renommer / copier chemin)
+        preview_actions = ttk.Frame(preview)
+        preview_actions.grid(row=2, column=0, sticky='ew', pady=(8, 0))
+
+        ttk.Button(preview_actions, text="Renommer…", command=lambda: _rename_selected_image()).pack(side='left')
+        ttk.Button(preview_actions, text="Copier le chemin", command=lambda: _copy_selected_image_path()).pack(side='left', padx=(6, 0))
+
+        # Footer
+        footer = ttk.Frame(root)
+        footer.pack(fill='x', pady=(10, 0))
+        ttk.Button(footer, text="Exporter la bibliothèque…", command=self.export_global_image_library).pack(side='left')
+        ttk.Button(footer, text="Fermer", command=win.destroy).pack(side='right')
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(footer, textvariable=status_var).pack(side='left', padx=(10, 0))
+
+        # state
+        self._imglib_entries: list[dict] = []
+
+        def _refresh_categories(select: str | None = None) -> None:
+            cats = img_lib_list_categories(gl)
+            cat_list.delete(0, 'end')
+            for c in cats:
+                cat_list.insert('end', c)
+            if not cats:
+                return
+            idx = 0
+            if select and select in cats:
+                idx = cats.index(select)
+            cat_list.selection_clear(0, 'end')
+            cat_list.selection_set(idx)
+            cat_list.activate(idx)
+            _refresh_images_for_selected_category()
+
+        def _selected_category() -> str:
+            try:
+                sel = cat_list.curselection()
+                if sel:
+                    return str(cat_list.get(sel[0]))
+            except Exception:
+                pass
+            return "Général"
+
+        def _refresh_images_for_selected_category(_evt=None) -> None:
+            cat = _selected_category()
+            lib = img_lib_list_library(gl)
+            entries = [it for it in lib if isinstance(it, dict) and str(it.get('category') or '') == cat]
+            entries.sort(key=lambda d: (str(d.get('name') or '').lower(), str(d.get('rel') or '')))
+            self._imglib_entries = entries
+            img_list.delete(0, 'end')
+            for it in entries:
+                nm = str(it.get('name') or '')
+                img_list.insert('end', nm)
+            status_var.set(f"{len(entries)} image(s) • {cat}")
+            # Sélection par défaut + aperçu
+            try:
+                img_list.selection_clear(0, 'end')
+                if entries:
+                    img_list.selection_set(0)
+                    img_list.activate(0)
+            except Exception:
+                pass
+            _refresh_preview_for_selected_image()
+
+
+        def _selected_image_entry() -> dict | None:
+            try:
+                sel = img_list.curselection()
+                if not sel:
+                    return None
+                i = int(sel[0])
+            except Exception:
+                return None
+            if i < 0 or i >= len(self._imglib_entries):
+                return None
+            it = self._imglib_entries[i]
+            return it if isinstance(it, dict) else None
+
+        def _copy_selected_image_path() -> None:
+            """Copie le chemin absolu de l'image sélectionnée."""
+            it = _selected_image_entry()
+            if not it:
+                return
+
+            try:
+                abs_path = img_lib_resolve_entry_abs(gl, it)  # type: ignore[arg-type]
+            except Exception:
+                rel = str(it.get('rel') or '')
+                abs_path = (Path(getattr(gl, 'root_dir', '.')) / rel).expanduser().resolve()
+
+            if not abs_path.exists():
+                messagebox.showwarning("Bibliothèque — Images", f"Fichier introuvable :\n\n{abs_path}", parent=win)
+                return
+
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(str(abs_path))
+                self.root.update_idletasks()
+                status_var.set("Chemin copié dans le presse-papiers.")
+            except Exception as e:
+                messagebox.showwarning("Bibliothèque — Images", f"Impossible de copier le chemin.\n\n{e}", parent=win)
+
+
+        def _rename_selected_image() -> None:
+            """Renomme l'image (nom logique) sans toucher au fichier."""
+            it = _selected_image_entry()
+            if not it:
+                return
+
+            old = str(it.get('name') or '')
+            new = simpledialog.askstring("Renommer l'image", "Nouveau nom :", initialvalue=old, parent=win)
+            if not new:
+                return
+            new = new.strip()
+            if not new or new == old:
+                return
+
+            try:
+                it['name'] = new
+            except Exception:
+                pass
+
+            try:
+                gl.save()
+            except Exception:
+                pass
+
+            # Réapplique la bibliothèque globale au projet courant (best-effort)
+            try:
+                self._sync_global_images_to_current_project()
+            except Exception:
+                pass
+
+            # Rafraîchit la liste et reselectionne l'image par id (si possible)
+            try:
+                target_id = str(it.get('id') or '')
+            except Exception:
+                target_id = ""
+
+            cat = _selected_category()
+            _refresh_images_for_selected_category()
+
+            if target_id:
+                try:
+                    for i, e in enumerate(getattr(self, "_imglib_entries", []) or []):
+                        if isinstance(e, dict) and str(e.get('id') or '') == target_id:
+                            img_list.selection_clear(0, 'end')
+                            img_list.selection_set(i)
+                            img_list.activate(i)
+                            break
+                except Exception:
+                    pass
+
+            _refresh_preview_for_selected_image()
+            status_var.set(f"Image renommée : {new}")
+
+
+        def _clear_preview() -> None:
+            try:
+                preview_img_lbl.configure(image="")
+            except Exception:
+                pass
+            try:
+                preview_info_var.set("")
+            except Exception:
+                pass
+            try:
+                self._imglib_preview_photo = None
+                self._imglib_preview_current_id = None
+            except Exception:
+                pass
+
+        def _refresh_preview_for_selected_image(_evt=None) -> None:
+            it = _selected_image_entry()
+            if not it:
+                _clear_preview()
+                return
+
+            try:
+                self._imglib_preview_current_id = str(it.get('id') or '')
+            except Exception:
+                self._imglib_preview_current_id = None
+
+            rel = str(it.get('rel') or '')
+            # IMPORTANT: résoudre depuis la racine de la bibliothèque globale.
+            # (Sans ça, une NameError sur resolve_image_abs entraîne un fallback
+            #  sur un chemin relatif au CWD, d'où "image introuvable".)
+            try:
+                abs_path = img_lib_resolve_entry_abs(gl, it)  # type: ignore[arg-type]
+            except Exception:
+                abs_path = (Path(getattr(gl, 'root_dir', '.')) / rel).expanduser().resolve()
+
+            if not abs_path.exists() or not abs_path.is_file():
+                try:
+                    preview_info_var.set(f"Fichier introuvable : {abs_path}")
+                except Exception:
+                    pass
+                try:
+                    preview_img_lbl.configure(image="")
+                except Exception:
+                    pass
+                self._imglib_preview_photo = None
+                return
+
+            # Taille cible (en fonction du widget si déjà affiché)
+            try:
+                max_w = int(preview.winfo_width() or 360) - 20
+                max_h = int(preview.winfo_height() or 420) - 70
+                if max_w < 180:
+                    max_w = 360
+                if max_h < 180:
+                    max_h = 360
+            except Exception:
+                max_w, max_h = 360, 360
+
+            w0 = int(it.get('w_px') or 0)
+            h0 = int(it.get('h_px') or 0)
+
+            try:
+                if Image is not None and ImageTk is not None:
+                    im = Image.open(abs_path)
+                    try:
+                        w0, h0 = im.size
+                    except Exception:
+                        pass
+                    im = im.convert('RGBA')
+                    # Compat PIL>=10 (Resampling) / PIL<10
+                    try:
+                        resample = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+                    except Exception:
+                        resample = getattr(Image, 'LANCZOS', 1)
+                    im.thumbnail((max_w, max_h), resample)
+                    ph = ImageTk.PhotoImage(im)
+                else:
+                    ph = tk.PhotoImage(file=str(abs_path))
+                    try:
+                        w0 = int(ph.width())
+                        h0 = int(ph.height())
+                        fx = max(1, int(w0 / max_w)) if max_w else 1
+                        fy = max(1, int(h0 / max_h)) if max_h else 1
+                        f = max(fx, fy)
+                        if f > 1:
+                            ph = ph.subsample(f, f)
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    preview_info_var.set(f"Impossible de charger l'image : {abs_path.name} ({e})")
+                except Exception:
+                    pass
+                try:
+                    preview_img_lbl.configure(image="")
+                except Exception:
+                    pass
+                self._imglib_preview_photo = None
+                return
+
+            self._imglib_preview_photo = ph
+            try:
+                preview_img_lbl.configure(image=ph)
+            except Exception:
+                pass
+
+            nm = str(it.get('name') or abs_path.stem)
+            try:
+                preview_info_var.set(f"{nm} • {w0}×{h0}px • {abs_path.name}")
+            except Exception:
+                pass
+
+        def _on_preview_resize(_evt=None) -> None:
+            # Recalcul thumbnail en cas de resize (debounce)
+            try:
+                after_id = getattr(self, '_imglib_preview_after_id', None)
+                if after_id:
+                    win.after_cancel(after_id)
+            except Exception:
+                pass
+
+            def _do():
+                try:
+                    if getattr(self, '_imglib_preview_current_id', None):
+                        _refresh_preview_for_selected_image()
+                except Exception:
+                    pass
+
+            try:
+                self._imglib_preview_after_id = win.after(180, _do)
+            except Exception:
+                pass
+
+        def _add_category() -> None:
+            name = simpledialog.askstring("Nouvelle catégorie", "Nom de la catégorie :", parent=win)
+            if not name:
+                return
+            cat = img_lib_add_category(gl, name)
+            try:
+                gl.save()
+            except Exception:
+                pass
+            _refresh_categories(select=cat)
+
+        def _add_images() -> None:
+            cat = _selected_category()
+            paths = filedialog.askopenfilenames(
+                title="Ajouter des images PNG",
+                filetypes=_sanitize_tk_filetypes([
+                    ("PNG", "*.png"),
+                    ("Tous fichiers", "*.*"),
+                ]),
+            )
+            if not paths:
+                return
+            created = img_lib_add_images(gl, list(paths), category=cat)
+            try:
+                gl.save()
+            except Exception:
+                pass
+            if created:
+                status_var.set(f"{len(created)} image(s) ajoutée(s) • {cat}")
+            self._sync_global_images_to_current_project()
+            _refresh_categories(select=cat)
+
+        def _delete_image() -> None:
+            try:
+                sel = img_list.curselection()
+                if not sel:
+                    return
+                idx = int(sel[0])
+            except Exception:
+                return
+            if idx < 0 or idx >= len(self._imglib_entries):
+                return
+            it = self._imglib_entries[idx]
+            nm = str(it.get('name') or 'image')
+            if not messagebox.askyesno("Supprimer", f"Supprimer l'image :\n\n{nm} ?", parent=win):
+                return
+            ok, msg = img_lib_remove_image(gl, str(it.get('id') or ''))
+            try:
+                gl.save()
+            except Exception:
+                pass
+            if ok:
+                status_var.set(msg)
+            else:
+                messagebox.showwarning("Bibliothèque d'images", msg, parent=win)
+            self._sync_global_images_to_current_project()
+            _refresh_images_for_selected_category()
+
+        cat_list.bind('<<ListboxSelect>>', _refresh_images_for_selected_category)
+        img_list.bind('<<ListboxSelect>>', _refresh_preview_for_selected_image)
+        try:
+            preview.bind('<Configure>', _on_preview_resize)
+        except Exception:
+            pass
+
+        # init
+        _refresh_categories(select=None)
+
 
     def _bind_undo_shortcuts(self) -> None:
         """Raccourci global pour annuler la dernière action (pastilles + points manuels)."""
@@ -3743,6 +4297,12 @@ class AppWindow:
             pass
         self.project.save()
 
+        # Bibliothèque d'images : synchro depuis la bibliothèque globale
+        try:
+            sync_global_library_to_project(self.project)
+        except Exception:
+            pass
+
         # recharge la bibliothèque d'images (outil Image)
 
         # GuideCorrection overlays
@@ -3793,6 +4353,18 @@ class AppWindow:
         except Exception:
             pass
         self.project.save()
+
+        # Bibliothèque d'images :
+        # 1) fusion du projet vers la bibliothèque globale (pour réutiliser entre projets)
+        # 2) puis synchro globale -> projet (pour éviter de réimporter)
+        try:
+            sync_project_library_to_global(self.project)
+        except Exception:
+            pass
+        try:
+            sync_global_library_to_project(self.project)
+        except Exception:
+            pass
 
         # GuideCorrection overlays
         try:

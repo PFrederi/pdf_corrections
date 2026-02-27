@@ -23,6 +23,9 @@ from app.ui.image_library import (
     remove_image_from_library,
     export_library_to_zip,
     import_library_from_zip,
+    get_global_library,
+    sync_project_library_to_global,
+    sync_global_library_to_project,
     DEFAULT_CATEGORY,
 )
 
@@ -263,9 +266,19 @@ class ImageStampTool:
         if not name:
             return
 
+        # Catégorie ajoutée dans la bibliothèque globale (persistante entre projets)
         try:
-            cc = add_category(prj, name)
-            prj.save()
+            gl = get_global_library()
+            cc = add_category(gl, name)  # type: ignore[arg-type]
+            try:
+                gl.save()
+            except Exception:
+                pass
+            # répercute dans le projet pour affichage
+            try:
+                sync_global_library_to_project(prj)
+            except Exception:
+                pass
             self.category_var.set(cc)
         except Exception as e:
             messagebox.showerror("Images", f"Impossible d'ajouter la catégorie.\n\n{e}")
@@ -309,7 +322,9 @@ class ImageStampTool:
         if not dest:
             return
 
-        ok, msg = export_library_to_zip(prj, dest, category=selected_cat)
+        # Export depuis la bibliothèque globale (commune à tous les projets)
+        gl = get_global_library()
+        ok, msg = export_library_to_zip(gl, dest, category=selected_cat)  # type: ignore[arg-type]
         if ok:
             messagebox.showinfo("Images", msg)
         else:
@@ -346,12 +361,20 @@ class ImageStampTool:
         if not src:
             return
 
-        ok, msg = import_library_from_zip(prj, src, mode="merge", category_override=None)
+        # Import dans la bibliothèque globale (persistante entre projets)
+        gl = get_global_library()
+        ok, msg = import_library_from_zip(gl, src, mode="merge", category_override=None)  # type: ignore[arg-type]
         if not ok:
             messagebox.showwarning("Images", msg)
             return
 
         try:
+            try:
+                gl.save()
+            except Exception:
+                pass
+            # répercute dans le projet
+            sync_global_library_to_project(prj)
             prj.save()
         except Exception:
             pass
@@ -406,12 +429,19 @@ class ImageStampTool:
         # Si l'utilisateur est sur "Tous", on met dans "Général".
         selected_cat = (self.category_var.get() or "Tous").strip() or "Tous"
         cat = DEFAULT_CATEGORY if selected_cat == "Tous" else selected_cat
-        created = add_images_to_library(prj, list(paths), category=cat)
+        # Ajout dans la bibliothèque globale, puis synchro vers le projet.
+        gl = get_global_library()
+        created = add_images_to_library(gl, list(paths), category=cat)  # type: ignore[arg-type]
         if not created:
             messagebox.showwarning("Images", "Aucune image PNG valide n'a été ajoutée.")
             return
 
         try:
+            try:
+                gl.save()
+            except Exception:
+                pass
+            sync_global_library_to_project(prj)
             prj.save()
         except Exception:
             pass
@@ -425,10 +455,25 @@ class ImageStampTool:
         entry = self.get_selected_entry()
         if not entry:
             return
+        # Supprime du projet (sécurité: refuse si utilisée par une annotation)
         ok, msg = remove_image_from_library(prj, str(entry.get("id") or ""))
         if not ok:
             messagebox.showwarning("Images", msg)
             return
+        # Répercute (best-effort) dans la bibliothèque globale :
+        # - si l'entrée a un global_id, on supprime directement.
+        # - sinon, on laisse la globale intacte (évite de casser d'autres projets).
+        try:
+            gl_id = str(entry.get("global_id") or "").strip()
+            if gl_id:
+                gl = get_global_library()
+                remove_image_from_library(gl, gl_id)  # type: ignore[arg-type]
+                try:
+                    gl.save()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             prj.save()
         except Exception:

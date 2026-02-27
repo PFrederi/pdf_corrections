@@ -1,6 +1,6 @@
 # Corrections PDF — Projets (Tkinter)
 
-**Version : v0.7.19**
+**Version : v0.7.29**
 
 - Import / Projet : suppression d’un PDF du projet avec confirmation (supprime aussi variantes + marques associées).
 - Correctif : évite l’erreur Tk ‘No more menus can be allocated’ lors des clics droits répétés.
@@ -9,6 +9,10 @@
 - **Menu Fichier** : Nouveau projet (demande le nom), Ouvrir projet, Enregistrer + liste des projets récents.
 - La barre haute ne contient plus les boutons **Nouveau/Ouvrir/Enregistrer** (tout est dans **Fichier**).
 - La barre haute ne contient plus **Nom du projet** (le nom reste dans le dossier du projet et dans project.json).
+- **Bibliothèque d’images globale** : les images importées sont désormais stockées dans une bibliothèque partagée et rechargée automatiquement à chaque changement de projet (plus besoin de réimporter). (stockage utilisateur dans le dossier **Pdf_correction**)
+- **Menu Bibliothèque → Images** : gestion de la bibliothèque globale (vue par catégories, ajout/suppression d’images, export ZIP).
+- Correctif : l’aperçu de la fenêtre **Bibliothèque → Images** charge maintenant les fichiers depuis la **bibliothèque globale** (et non depuis le dossier du projet).
+- Correctif : résolution **ultra robuste** des fichiers d’images de bibliothèque (gère aussi des suffixes non-hex, espaces/accents, et des renommages où seul le début du nom est identique) — l’aperçu retrouve automatiquement le bon fichier.
 
 
 Fonctions :
